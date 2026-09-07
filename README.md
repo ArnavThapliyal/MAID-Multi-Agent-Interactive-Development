@@ -35,3 +35,13 @@
 "Frontend","https://github.com/RooCodeInc/Roo-Code","User Interaction / IDE Client","While the official extension was archived, the open-source architecture (using Cline or the community ZooCode fork) serves as the perfect lightweight UI bridge to bind your local backend services to the editor  ."
 
 
+👥 The Default MAID Team Configuration
+Since free APIs are constantly added, removed, or rate-limited on OmniRoute, your agent configuration must be highly dynamic and resilient.
+
+Agent ID	Core Role	Default Model Target (OmniRoute)	Failover / Backup Strategy
+Agent 0	The Local Anchor	Local LLM (e.g., Ollama / Llama-3-8B)	No internet needed. Always available as your fallback code generator if APIs drop offline.
+Agent 1	Primary API Agent	Gemini / DeepSeek (via OmniRoute free endpoint)	If rate-limited, OmniRoute dynamically routes to the next available free provider.
+Agent 2	Secondary API Agent	Claude / GPT (via OmniRoute free endpoint)	Falls back to Agent 1's models or Agent 0 (local) if API endpoints fail.
+Agent 3	Specialist/Search Agent	Fast LLM with Web Access (SearXNG)	Falls back to basic local processing if search or APIs are unavailable.
+
+
