@@ -106,7 +106,7 @@ All LLM traffic goes through Headroom for compression, then OmniRoute for routin
 
 ## 3. Three-agent bridge (Implemented)
 
-The part that runs today is `bridge/`. It does not yet use Headroom, OmniRoute, SearXNG, LangGraph or a sandbox.
+The part that runs today is `bridge/`. It does not yet use Headroom, OmniRoute, SearXNG, LangGraph or a container sandbox; its own sandbox gate (below) confines agents to the repository.
 
 | Agent | Runs as | Role |
 |---|---|---|
@@ -121,8 +121,68 @@ The part that runs today is `bridge/`. It does not yet use Headroom, OmniRoute, 
 3. **Routing and isolated execution**: for each unit Agent 0 calls `ask_agy` or `ask_claude`. The orchestrator wraps every call with the repo map, the spec and the isolation rules.
 4. **Cross-verification and rollback**: the orchestrator checkpoints git state and file contents before the worker runs, then checks scope, syntax, optional tests, and has the other agent review the diff. A failed unit is rolled back and retried.
 
-`bridge/lmstudio_mcp.py` is the reverse path: an MCP server whose `ask_local_model` tool lets agy and Claude Code call the local model.
+`bridge/lmstudio_mcp.py` is the reverse path: an MCP server whose `ask_local_model` tool lets agy and Claude Code call the local model, and whose `request_outside_access` tool lets them ask for a path outside the repository.
 
 Every script logs to `log/maid_execution.jsonl` and `log/maid_human.log` through `logg-template/LoggingTemplate.py`, tied together by a correlation ID per run.
+
+### Modules
+
+| Module | Responsibility |
+|---|---|
+| `orchestrator.py` | The four phases, worker CLI calls, checkpoint/verify/rollback, `--self-test`. |
+| `maid_runtime.py` | `RunControl` (live state, pause/halt/steer, question and permission prompts) and `SandboxGate`. |
+| `maid_common.py` | Config, model discovery and runtime switching, the streaming LM Studio client, telemetry and the status line. |
+| `maid_ui.py` | The dashboard: `http.server`, REST endpoints, Server-Sent Events. |
+| `lmstudio_mcp.py` | MCP stdio server for agy and Claude Code. |
+
+### Run control
+
+The orchestrator never talks to the user directly. It goes through one `RunControl` object:
+
+```
+            terminal                                  browser
+               ▲                                         ▲
+               │ input()/print()                         │ SSE + REST
+        ┌──────┴───────┐                         ┌───────┴────────┐
+        │  RunControl  │   (base class)          │   UIControl    │  (maid_ui.py)
+        └──────┬───────┘                         └───────┬────────┘
+               └──────────────────┬──────────────────────┘
+                                  ▼
+                        orchestrator.py (one run per process)
+```
+
+`RunControl` holds the live state the dashboard renders (agent states, unit cards, messages), the pause and halt flags, queued steering text, and the two prompts a run can raise: clarifying questions and sandbox permission requests. The dashboard runs the orchestrator in a worker thread and answers those prompts from HTTP requests.
+
+### Model switching
+
+`maid_common` keeps the active model of each agent in one place (`get_model` / `set_model`). Every call site reads it at call time, so a switch from the CLI flags or the dashboard applies to the next model or worker call. `discover_models()` lists what is available: LM Studio's `/v1/models`, `agy models`, and a static alias list for Claude Code.
+
+### Streaming
+
+`lmstudio_chat()` requests `stream: true` and reads the SSE stream, rebuilding content, reasoning and tool calls with `StreamAccumulator`. Each chunk goes to `log/lmstudio_stream.log` and to registered listeners; the orchestrator's listener forwards it to `RunControl.chunk()`, and from there to the dashboard's TERMINAL / STREAM tab. Worker CLIs run under `Popen` and their stdout and stderr are forwarded line by line the same way.
+
+### Sandbox gate
+
+```
+ Agent 0 writes worker prompt ──▶ pre-scan for outside paths ──┐
+                                                               ▼
+ worker calls MCP request_outside_access ──▶ log/sandbox/<id>/req-*.json ──▶ SandboxGate.request()
+                                                               │
+                              awaiting_permission, SANDBOX_PERMISSION_REQUEST logged
+                                                               ▼
+                    user: Approve Once | Approve for Session | Deny & Constrain to Repo
+                                                               │
+              approved dir ──▶ `--add-dir` on the next worker call      denied ──▶ stated in the worker prompt
+```
+
+The lock itself is the worker CLIs' own behaviour: they run with the repository as working directory and, headless, refuse paths outside it. The gate is the only way a directory gets added. The MCP server is a grandchild of the orchestrator, so the two exchange requests and answers as files under `log/sandbox/<correlation-id>/`; a request nobody answers is denied.
+
+### Review fallback
+
+A reviewer that errors or returns no verdict is asked once more; then Agent 0 audits the diff locally; if there is still no verdict the unit fails. Each step logs `REVIEW_FALLBACK`.
+
+### Telemetry and private APIs
+
+The status line is built from data MAID already has: LM Studio's token usage, the cost and usage in `claude -p --output-format json`, and its own count of agy calls. MAID calls no private or undocumented vendor endpoint. Claude's 5-hour and 7-day percentages appear only if a local file provides them.
 
 Setup and usage are in the [README](../README.md).
