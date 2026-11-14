@@ -1,0 +1,8 @@
+.aider*
+.DS_Store
+__pycache__/
+
+# Runtime logs and rollback backups (log/.gitkeep stays tracked)
+log/*.log
+log/*.jsonl
+log/backups/
