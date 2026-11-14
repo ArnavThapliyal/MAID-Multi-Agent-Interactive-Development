@@ -24,6 +24,7 @@ Phases
 Usage
     python3 bridge/orchestrator.py "task" [--no-clarify] [--plan-only] [--no-review]
         [--test-cmd "pytest -q"] [--max-retries 1] [--max-units 8] [--repo PATH]
+    python3 bridge/orchestrator.py --self-test
 
 Environment
     MAID_AGY_BIN / MAID_AGY_MODEL / MAID_AGY_TIMEOUT    agy binary, model, --print-timeout
@@ -59,9 +60,12 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -572,7 +576,8 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
             flags += ["--mode", "accept-edits"]
         argv = [AGY_BIN, "--print", prompt] + flags
     else:
-        flags = ["--output-format", "json"]
+        # Per-call allow rule, so the reverse bridge works without editing user settings
+        flags = ["--output-format", "json", "--allowedTools", "mcp__lmstudio__ask_local_model"]
         if allow_edits:
             flags += ["--permission-mode", "acceptEdits"]
         if CLAUDE_MODEL:
@@ -863,15 +868,68 @@ def check_syntax(repo, file):
     return True, "no syntax checker for %s files; skipped" % (suffix or "extensionless")
 
 
+def parse_verdict(text):
+    """Return "PASS" or "FAIL" from a reviewer's reply, or None if it gave no verdict.
+
+    @rollback: none (pure).
+    """
+    verdict = re.search(r"VERDICT:\s*(PASS|FAIL)", text or "")
+    return verdict.group(1) if verdict else None
+
+
+def agent0_audit(unit, diff):
+    """Last-resort review: have Agent 0 (the local model) audit the diff itself.
+
+    Returns: (verdict, reasons) where verdict is "PASS", "FAIL" or None if Agent 0
+        was unreachable or gave no usable answer.
+
+    Side effects: Agent 0 calls only; nothing leaves this machine.
+    @rollback: none needed.
+    """
+
+    def validate(parsed):
+        verdict = str(parsed.get("verdict") or "").strip().upper()
+        if verdict not in ("PASS", "FAIL"):
+            raise ValueError('"verdict" must be "PASS" or "FAIL"')
+        return verdict, str(parsed.get("reasons") or "").strip()
+
+    try:
+        return agent0_json(
+            [
+                {"role": "system", "content": AGENT0_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        "Audit this diff against the unit below. PASS only if it implements the unit "
+                        "correctly, with no obvious bugs, inside the unit's scope.\n"
+                        'Reply with one JSON object only: {"verdict": "PASS or FAIL", "reasons": "..."}\n\n'
+                        "## Unit\n%s\n\n## Diff\n%s" % (json.dumps(unit, indent=2), diff[:DIFF_LIMIT])
+                    ),
+                },
+            ],
+            validate,
+            "diff audit %s" % unit["id"],
+            attempts=2,
+        )
+    except (OSError, ValueError) as error:
+        return None, repr(error)
+
+
 def review_diff(repo, unit, diff, worker_agent):
     """Have the agent that did not write the change review its diff.
 
-    Returns: (ok, detail). An unusable review (CLI failure or no verdict) is reported
-        as inconclusive and does not fail the unit, since the mechanical checks
-        have already passed by the time this runs.
+    An unusable review never passes silently. The escalation is:
+      1. the other cloud agent reviews;
+      2. if it errors or returns no verdict, it is asked once more;
+      3. if that also fails, Agent 0 audits the diff locally;
+      4. if no reviewer produces a verdict, the check FAILS.
+    Every step down this ladder logs a REVIEW_FALLBACK event.
 
-    Side effects: one read-only worker CLI call; the diff leaves this machine.
-    @rollback: none needed (the reviewer runs without edit permission).
+    Returns: (ok, detail).
+
+    Side effects: up to two read-only worker CLI calls (the diff leaves this machine)
+        and up to two Agent 0 calls.
+    @rollback: none needed (reviewers run without edit permission).
     """
     reviewer = "claude" if worker_agent == "agy" else "agy"
     prompt = (
@@ -881,11 +939,38 @@ def review_diff(repo, unit, diff, worker_agent):
         "Reply with the first line exactly `VERDICT: PASS` or `VERDICT: FAIL`, then your reasons briefly.\n\n"
         "## Unit\n%s\n\n## Diff\n%s" % (json.dumps(unit, indent=2), diff[:DIFF_LIMIT])
     )
-    result = run_cli(reviewer, prompt, repo, allow_edits=False, purpose="review %s" % unit["id"])
-    verdict = re.search(r"VERDICT:\s*(PASS|FAIL)", result["text"]) if result["ok"] else None
-    if not verdict:
-        return True, "inconclusive review by %s (no verdict returned)" % reviewer
-    return verdict.group(1) == "PASS", "%s review: %s" % (reviewer, result["text"])
+    for attempt, next_step in ((1, "retry_same_reviewer"), (2, "agent0_audit")):
+        result = run_cli(reviewer, prompt, repo, allow_edits=False, purpose="review %s" % unit["id"])
+        verdict = parse_verdict(result["text"]) if result["ok"] else None
+        if verdict:
+            return verdict == "PASS", "%s review: %s" % (reviewer, result["text"])
+        log_event(
+            logger,
+            "REVIEW_FALLBACK",
+            "%s: %s gave no verdict (attempt %d); falling back to %s" % (unit["id"], reviewer, attempt, next_step),
+            level=30,
+            unit=unit["id"],
+            reviewer=reviewer,
+            attempt=attempt,
+            fallback=next_step,
+            reviewer_ok=result["ok"],
+            reviewer_reply=result["text"],
+            reviewer_stderr=result["stderr"],
+        )
+    verdict, reasons = agent0_audit(unit, diff)
+    if verdict:
+        return verdict == "PASS", "agent 0 audit (fallback after %s gave no verdict): %s %s" % (reviewer, verdict, reasons)
+    log_event(
+        logger,
+        "REVIEW_FALLBACK",
+        "%s: no reviewer produced a verdict; failing the review" % unit["id"],
+        level=40,
+        unit=unit["id"],
+        reviewer="agent0",
+        fallback="fail",
+        error=reasons,
+    )
+    return False, "review inconclusive: %s (twice) and the Agent 0 audit returned no verdict" % reviewer
 
 
 def verify_unit(repo, unit, state, worker_agent, args):
@@ -956,8 +1041,12 @@ def verify_unit(repo, unit, state, worker_agent, args):
     return passed, checks, touched
 
 
-def execute_unit(plan, unit, repo, repo_map, spec_path, args):
+def execute_unit(plan, unit, repo, repo_map, spec_path, args, route=None):
     """Run Phases 3 and 4 for one unit, retrying after a rollback on failure.
+
+    Args:
+        route: optional replacement for route_unit() with the same signature, used by
+            the self-test to make routing deterministic.
 
     Returns: dict with unit, status ("passed" or "failed"), agent, attempts, checks,
         and rollback (the command to undo a passed unit, or a note for a failed one).
@@ -969,7 +1058,7 @@ def execute_unit(plan, unit, repo, repo_map, spec_path, args):
     feedback = ""
     agent, checks = unit["suggested_agent"], []
     for attempt in range(1, args.max_retries + 2):
-        agent, instructions, _ = route_unit(plan, unit, repo_map, feedback)
+        agent, instructions, _ = (route or route_unit)(plan, unit, repo_map, feedback)
         print("[%s] attempt %d -> %s: %s %s" % (unit["id"], attempt, agent, unit["action"], unit["file"]))
         # Invariant: the checkpoint is taken after routing and immediately before the worker runs
         state = checkpoint(repo, unit, attempt)
@@ -1022,6 +1111,246 @@ def append_results(spec_path, results, plan):
 
 
 # --------------------------------------------------------------------------- #
+# Self-test: three-way mesh and retry-after-rollback
+# --------------------------------------------------------------------------- #
+
+STUB_WORKER = r"""#!%(python)s
+# Deterministic stand-in for a worker CLI, used only by exercise_retry_rollback().
+# Attempt 1 breaks the target and strays outside the unit; attempt 2 behaves.
+import json, os, pathlib
+state_path = pathlib.Path(os.environ["MAID_STUB_STATE"])
+state = json.loads(state_path.read_text()) if state_path.exists() else {"calls": 0}
+state["calls"] += 1
+target = pathlib.Path("target.py")
+if state["calls"] == 1:
+    target.write_text("def broken(:\n")
+    pathlib.Path("stray.txt").write_text("out of scope\n")
+else:
+    state["seen_before_attempt2"] = target.read_text()
+    state["stray_present_before_attempt2"] = pathlib.Path("stray.txt").exists()
+    target.write_text("VALUE = 3\n")
+state_path.write_text(json.dumps(state))
+print("stub worker call %%d" %% state["calls"])
+"""
+
+
+def exercise_retry_rollback():
+    """Drive the real execute_unit() through a failed attempt, a rollback and a retry.
+
+    Uses a throwaway git repo and a stub worker binary, so it is deterministic and
+    needs no model or network. The target file starts with an uncommitted edit, so
+    the rollback has to restore it from log/backups/<correlation-id>/ rather than
+    from git.
+
+    Returns: (ok, detail, checks) where checks maps each assertion to True/False.
+
+    State mutations: creates and deletes a temporary directory; temporarily replaces
+        the module-level AGY_BIN and the MAID_STUB_STATE environment variable;
+        writes then deletes log/backups/<correlation-id>/U1-attempt*/.
+    @rollback: none needed; everything is restored or removed in the `finally` block.
+    """
+    global AGY_BIN
+    dirty_text = "VALUE = 2  # uncommitted user edit\n"
+    workdir = Path(tempfile.mkdtemp(prefix="maid-retry-"))
+    repo = workdir / "repo"
+    saved_bin, saved_env = AGY_BIN, os.environ.get("MAID_STUB_STATE")
+    backup_root = LOG_DIR / "backups" / get_correlation_id()
+    try:
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "target.py").write_text("VALUE = 1\n")
+        git(repo, "add", ".")
+        git(repo, "-c", "user.name=maid", "-c", "user.email=maid@localhost", "commit", "-q", "-m", "init")
+        (repo / "target.py").write_text(dirty_text)
+        spec_path = repo / "spec.md"
+        spec_path.write_text("# stub spec\n")
+
+        stub = workdir / "stub_worker.py"
+        stub.write_text(STUB_WORKER % {"python": sys.executable})
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+        state_path = workdir / "stub_state.json"
+        AGY_BIN = str(stub)
+        os.environ["MAID_STUB_STATE"] = str(state_path)
+
+        unit = {
+            "id": "U1", "file": "target.py", "symbol": "", "action": "modify",
+            "description": "set VALUE", "signatures": [], "suggested_agent": "agy",
+            "routing_reason": "self-test", "acceptance": [],
+        }
+        args = argparse.Namespace(test_cmd="", no_review=True, max_retries=1)
+        result = execute_unit(
+            {"title": "retry exercise", "summary": "", "units": [unit]},
+            unit, repo, "target.py", spec_path, args,
+            route=lambda plan, unit, repo_map, feedback: ("agy", "stub instructions", "self-test"),
+        )
+        stub_state = json.loads(state_path.read_text())
+        checks = {
+            "attempt 1 failed verification": stub_state["calls"] == 2,
+            "target restored from backup before attempt 2": stub_state.get("seen_before_attempt2") == dirty_text,
+            "out-of-scope file removed by rollback": stub_state.get("stray_present_before_attempt2") is False,
+            "attempt 1 backup holds the pre-change file": read_text(backup_root / "U1-attempt1" / "target.py") == dirty_text,
+            "attempt 2 passed": result["status"] == "passed" and result["attempts"] == 2,
+            "final content is attempt 2's": read_text(repo / "target.py") == "VALUE = 3\n",
+        }
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        return False, "exercise crashed: %r" % error, {}
+    finally:
+        AGY_BIN = saved_bin
+        if saved_env is None:
+            os.environ.pop("MAID_STUB_STATE", None)
+        else:
+            os.environ["MAID_STUB_STATE"] = saved_env
+        shutil.rmtree(workdir, ignore_errors=True)
+        for attempt_dir in backup_root.glob("U1-attempt*"):
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+    failed = [name for name, ok in checks.items() if not ok]
+    log_event(logger, "self_test_retry", "retry-after-rollback exercise", level=40 if failed else 20, checks=checks)
+    return not failed, ("all %d checks held" % len(checks)) if not failed else "failed: " + "; ".join(failed), checks
+
+
+def _dispatch_via_agent0(tool, request):
+    """Have Agent 0 dispatch `request` through the single offered worker tool.
+
+    Returns: the prompt Agent 0 wrote for the worker.
+    Raises: ValueError if Agent 0 made no usable tool call; OSError if unreachable.
+    Side effects: one Agent 0 call.
+    @rollback: none needed.
+    """
+    reply = lmstudio_chat(
+        logger,
+        [{"role": "system", "content": AGENT0_SYSTEM}, {"role": "user", "content": request}],
+        tools=[tool],
+        tool_choice="required",
+        purpose="self-test dispatch via %s" % tool["function"]["name"],
+    )
+    try:
+        call = (reply.get("tool_calls") or [])[0]["function"]
+        prompt = str(json.loads(call["arguments"])["prompt"]).strip()
+    except (IndexError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("Agent 0 made no usable %s call: %r" % (tool["function"]["name"], error))
+    if call["name"] != tool["function"]["name"] or not prompt:
+        raise ValueError("Agent 0 called %r instead of %s" % (call["name"], tool["function"]["name"]))
+    return prompt
+
+
+def _mcp_calls_logged(nonce):
+    """Return True if this run's log holds an ask_local_model call whose prompt contains `nonce`.
+
+    Proves the call went through bridge/lmstudio_mcp.py under this correlation ID.
+    Side effects: reads log/maid_execution.jsonl.
+    @rollback: none.
+    """
+    log_path = LOG_DIR / "maid_execution.jsonl"
+    if not log_path.is_file():
+        return False
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if nonce not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            record.get("event") == "mcp_tool_call"
+            and record.get("correlation_id") == get_correlation_id()
+            and nonce in str(record.get("data", {}).get("prompt"))
+        ):
+            return True
+    return False
+
+
+def self_test(repo, live=True):
+    """Verify the three-way mesh and the retry path; return a list of result rows.
+
+    Legs (the first three need LM Studio, agy and claude, and are skipped when
+    live=False):
+      1. Agent 0 -> agy      Agent 0 dispatches an isolated task through ask_agy.
+      2. Agent 0 -> claude   Agent 0 dispatches a review task through ask_claude.
+      3. agy & claude -> Agent 0   both call ask_local_model through the MCP server,
+                             proven by log records under this run's correlation ID.
+      4. Retry after rollback   exercise_retry_rollback(), offline and deterministic.
+
+    Returns: list of {"leg", "ok", "detail", "duration_s"}.
+
+    Side effects: live legs send prompts to agy and claude (read-only, no edits).
+    @rollback: none needed; no leg changes the repository.
+    """
+    token = uuid.uuid4().hex[:8].upper()
+    rows = []
+
+    def leg(name, check):
+        started = time.monotonic()
+        try:
+            ok, detail = check()
+        except (OSError, ValueError, KeyError) as error:
+            ok, detail = False, "%s: %s" % (type(error).__name__, error)
+        rows.append({"leg": name, "ok": ok, "detail": detail, "duration_s": round(time.monotonic() - started, 1)})
+        log_event(logger, "self_test_leg", "%s: %s" % (name, "PASS" if ok else "FAIL"), level=20 if ok else 40, leg=name, ok=ok, detail=detail)
+        print("  %s  %s" % ("PASS" if ok else "FAIL", name), flush=True)
+
+    def agent0_to_agy():
+        expected = "MESH-AGY-%s" % token
+        prompt = _dispatch_via_agent0(
+            WORKER_TOOLS[0],
+            "Dispatch this isolated task with ask_agy: the worker must reply with exactly the text %s "
+            "and nothing else, without reading or changing any file." % expected,
+        )
+        result = run_cli("agy", prompt, repo, allow_edits=False, purpose="self-test leg 1")
+        return result["ok"] and expected in result["text"], "agy replied %r" % result["text"][:80]
+
+    def agent0_to_claude():
+        diff = "--- a/add.py\n+++ b/add.py\n@@ -0,0 +1,2 @@\n+def add(a, b):\n+    return a + b\n"
+        prompt = _dispatch_via_agent0(
+            WORKER_TOOLS[1],
+            "Dispatch this review task with ask_claude. Include the diff below verbatim in the prompt and "
+            "instruct the reviewer to verify that it correctly adds a function returning the sum of two "
+            "numbers, replying with a first line of exactly `VERDICT: PASS` or `VERDICT: FAIL`, without "
+            "changing any file.\n\n%s" % diff,
+        )
+        result = run_cli("claude", prompt, repo, allow_edits=False, purpose="self-test leg 2")
+        verdict = parse_verdict(result["text"])
+        return result["ok"] and verdict == "PASS", "claude returned verdict %s" % verdict
+
+    def workers_to_agent0():
+        details, ok = [], True
+        for agent in AGENTS:
+            nonce = "MESH-%s-%s" % (agent.upper(), token)
+            run_cli(
+                agent,
+                "Call the ask_local_model tool from the lmstudio MCP server with exactly this prompt: "
+                "'Reply with exactly: %s'. Then report the tool's reply verbatim. Do not change any file." % nonce,
+                repo,
+                allow_edits=False,
+                purpose="self-test leg 3 (%s)" % agent,
+            )
+            logged = _mcp_calls_logged(nonce)
+            ok = ok and logged
+            details.append("%s %s" % (agent, "reached the MCP server" if logged else "did NOT reach the MCP server"))
+        return ok, "; ".join(details) + " (correlation ID %s)" % get_correlation_id()
+
+    if live:
+        leg("Leg 1: Agent 0 -> agy (isolated task)", agent0_to_agy)
+        leg("Leg 2: Agent 0 -> claude (review task)", agent0_to_claude)
+        leg("Leg 3: agy & claude -> Agent 0 (MCP ask_local_model)", workers_to_agent0)
+    leg("Retry after rollback (deterministic)", lambda: exercise_retry_rollback()[:2])
+    return rows
+
+
+def print_self_test(rows):
+    """Print the self-test results as a table.
+
+    @rollback: none (output only).
+    """
+    width = max(len(row["leg"]) for row in rows)
+    print("\n%-*s  %-6s  %7s  %s" % (width, "CHECK", "RESULT", "TIME", "DETAIL"))
+    print("%s  %s  %s  %s" % ("-" * width, "-" * 6, "-" * 7, "-" * 40))
+    for row in rows:
+        print("%-*s  %-6s  %6.1fs  %s" % (width, row["leg"], "PASS" if row["ok"] else "FAIL", row["duration_s"], row["detail"]))
+    passed = sum(1 for row in rows if row["ok"])
+    print("\n%d/%d passed" % (passed, len(rows)))
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 
@@ -1032,7 +1361,8 @@ def parse_args(argv):
     @rollback: none (pure).
     """
     parser = argparse.ArgumentParser(description="MAID three-agent orchestrator (Agent 0 + agy + claude).")
-    parser.add_argument("task", help="the task, in plain language")
+    parser.add_argument("task", nargs="?", default="", help="the task, in plain language")
+    parser.add_argument("--self-test", action="store_true", help="verify the three-way mesh and the retry path, then exit")
     parser.add_argument("--no-clarify", action="store_true", help="skip Phase 1 clarifying questions")
     parser.add_argument("--plan-only", action="store_true", help="stop after writing the spec; run no workers")
     parser.add_argument("--no-review", action="store_true", help="skip the cross-agent diff review")
@@ -1055,6 +1385,14 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     new_correlation_id()
     repo = Path(args.repo).resolve()
+    if args.self_test:
+        log_event(logger, "self_test_start", "self-test %s started" % get_correlation_id(), repo=str(repo))
+        rows = self_test(repo)
+        print_self_test(rows)
+        return 0 if all(row["ok"] for row in rows) else 1
+    if not args.task:
+        print('usage: orchestrator.py "task" [options]  (or --self-test)', file=sys.stderr)
+        return 2
     base_commit = git_head(repo)
     log_event(
         logger,
