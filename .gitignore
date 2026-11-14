@@ -6,3 +6,5 @@ __pycache__/
 log/*.log
 log/*.jsonl
 log/backups/
+log/*.json
+log/sandbox/

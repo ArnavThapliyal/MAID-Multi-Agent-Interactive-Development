@@ -27,8 +27,10 @@ Usage
     python3 bridge/orchestrator.py --self-test
 
 Environment
-    MAID_AGY_BIN / MAID_AGY_MODEL / MAID_AGY_TIMEOUT    agy binary, model, --print-timeout
-    MAID_CLAUDE_BIN / MAID_CLAUDE_MODEL                 claude binary, optional model
+    MAID_AGY_BIN / MAID_AGY_TIMEOUT                     agy binary, --print-timeout
+    MAID_CLAUDE_BIN                                     claude binary
+    models: --local-model / --agy-model / --claude-model, or the MAID_*_MODEL variables;
+    `--list-models` shows what each agent can use
     MAID_WORKER_TIMEOUT                                 hard limit per CLI call, seconds
     plus those in bridge/maid_common.py and logg-template/LoggingTemplate.py
 
@@ -70,23 +72,27 @@ from datetime import datetime
 from pathlib import Path
 
 from maid_common import (
-    LMSTUDIO_MODEL,
     LOG_DIR,
     REPO_ROOT,
+    TELEMETRY,
+    Telemetry,
+    discover_models,
     get_correlation_id,
     get_maid_logger,
+    get_model,
+    get_models,
     git,
     git_head,
     lmstudio_chat,
     log_event,
     new_correlation_id,
+    set_model,
+    status_line,
 )
 
 AGY_BIN = os.getenv("MAID_AGY_BIN", "agy")
-AGY_MODEL = os.getenv("MAID_AGY_MODEL", "gemini-3.8-flash-medium")
 AGY_TIMEOUT = os.getenv("MAID_AGY_TIMEOUT", "10m")
 CLAUDE_BIN = os.getenv("MAID_CLAUDE_BIN", "claude")
-CLAUDE_MODEL = os.getenv("MAID_CLAUDE_MODEL", "")
 WORKER_TIMEOUT = float(os.getenv("MAID_WORKER_TIMEOUT", "900"))
 
 AGENTS = ("agy", "claude")
@@ -491,7 +497,7 @@ def render_spec(task, clarifications, plan, repo, base_commit):
         "| Correlation ID | `%s` |" % get_correlation_id(),
         "| Created | %s |" % datetime.now().astimezone().isoformat(timespec="seconds"),
         "| Base commit | `%s` |" % base_commit,
-        "| Planner | Agent 0 (`%s`) |" % LMSTUDIO_MODEL,
+        "| Planner | Agent 0 (`%s`) |" % get_model("local"),
         "",
         "## Task",
         "",
@@ -571,7 +577,8 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
     @rollback: restore from the caller's checkpoint with rollback_unit().
     """
     if agent == "agy":
-        flags = ["--model", AGY_MODEL, "--print-timeout", AGY_TIMEOUT]
+        # Invariant: models are read at call time, so a runtime switch applies to the next call
+        flags = ["--model", get_model("agy"), "--print-timeout", AGY_TIMEOUT]
         if allow_edits:
             flags += ["--mode", "accept-edits"]
         argv = [AGY_BIN, "--print", prompt] + flags
@@ -580,8 +587,8 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
         flags = ["--output-format", "json", "--allowedTools", "mcp__lmstudio__ask_local_model"]
         if allow_edits:
             flags += ["--permission-mode", "acceptEdits"]
-        if CLAUDE_MODEL:
-            flags += ["--model", CLAUDE_MODEL]
+        if get_model("claude"):
+            flags += ["--model", get_model("claude")]
         argv = [CLAUDE_BIN, "-p", prompt] + flags
 
     head_before = git_head(repo)
@@ -621,15 +628,19 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
 
     ok = returncode == 0
     text = stdout.strip()
-    if agent == "claude" and ok:
+    duration = round(time.monotonic() - started, 3)
+    if agent == "claude":
         # `claude -p --output-format json` prints one JSON object; the reply is in "result"
+        parsed = {}
         try:
             parsed = extract_json(stdout)
             text = str(parsed.get("result") or "").strip()
-            ok = not parsed.get("is_error", False)
+            ok = ok and not parsed.get("is_error", False)
         except ValueError:
             ok = False
-    duration = round(time.monotonic() - started, 3)
+        TELEMETRY.record_claude(parsed, ok)
+    else:
+        TELEMETRY.record_agy(duration, ok, stdout + stderr)
     log_event(
         logger,
         "cli_result",
@@ -1069,6 +1080,7 @@ def execute_unit(plan, unit, repo, repo_map, spec_path, args, route=None):
             command = rollback_command(repo, unit, state)
             log_event(logger, "unit_passed", "%s passed" % unit["id"], unit=unit["id"], agent=agent, attempt=attempt, rollback_command=command)
             print("[%s] passed. Rollback: %s" % (unit["id"], command))
+            print(status_line(repo))
             return {"unit": unit, "status": "passed", "agent": agent, "attempts": attempt, "checks": checks, "rollback": command}
 
         failures = "; ".join("%s: %s" % (check["name"], check["detail"]) for check in checks if not check["ok"])
@@ -1145,15 +1157,16 @@ def exercise_retry_rollback():
     Returns: (ok, detail, checks) where checks maps each assertion to True/False.
 
     State mutations: creates and deletes a temporary directory; temporarily replaces
-        the module-level AGY_BIN and the MAID_STUB_STATE environment variable;
+        the module-level AGY_BIN and TELEMETRY and the MAID_STUB_STATE environment
+        variable;
         writes then deletes log/backups/<correlation-id>/U1-attempt*/.
     @rollback: none needed; everything is restored or removed in the `finally` block.
     """
-    global AGY_BIN
+    global AGY_BIN, TELEMETRY
     dirty_text = "VALUE = 2  # uncommitted user edit\n"
     workdir = Path(tempfile.mkdtemp(prefix="maid-retry-"))
     repo = workdir / "repo"
-    saved_bin, saved_env = AGY_BIN, os.environ.get("MAID_STUB_STATE")
+    saved_bin, saved_env, saved_telemetry = AGY_BIN, os.environ.get("MAID_STUB_STATE"), TELEMETRY
     backup_root = LOG_DIR / "backups" / get_correlation_id()
     try:
         repo.mkdir()
@@ -1170,6 +1183,8 @@ def exercise_retry_rollback():
         stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
         state_path = workdir / "stub_state.json"
         AGY_BIN = str(stub)
+        # The stub is not agy: keep its calls out of the real agy counters
+        TELEMETRY = Telemetry(workdir / "telemetry.json")
         os.environ["MAID_STUB_STATE"] = str(state_path)
 
         unit = {
@@ -1195,7 +1210,7 @@ def exercise_retry_rollback():
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         return False, "exercise crashed: %r" % error, {}
     finally:
-        AGY_BIN = saved_bin
+        AGY_BIN, TELEMETRY = saved_bin, saved_telemetry
         if saved_env is None:
             os.environ.pop("MAID_STUB_STATE", None)
         else:
@@ -1370,6 +1385,10 @@ def parse_args(argv):
     parser.add_argument("--max-retries", type=int, default=1, help="retries per unit after a rollback (default 1)")
     parser.add_argument("--max-units", type=int, default=8, help="most atomic units a plan may have (default 8)")
     parser.add_argument("--repo", default=str(REPO_ROOT), help="repository to work in (default: this repo)")
+    parser.add_argument("--local-model", default="", help="Agent 0 model for this run (overrides MAID_LMSTUDIO_MODEL)")
+    parser.add_argument("--agy-model", default="", help="agy model for this run (overrides MAID_AGY_MODEL)")
+    parser.add_argument("--claude-model", default="", help="claude model for this run (overrides MAID_CLAUDE_MODEL)")
+    parser.add_argument("--list-models", action="store_true", help="print the models each agent can use, then exit")
     return parser.parse_args(argv)
 
 
@@ -1385,10 +1404,20 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     new_correlation_id()
     repo = Path(args.repo).resolve()
+    for agent, name in (("local", args.local_model), ("agy", args.agy_model), ("claude", args.claude_model)):
+        if name:
+            set_model(agent, name)
+    if args.list_models:
+        for agent, info in discover_models().items():
+            print("%s (current: %s, source: %s)%s" % (agent, info["current"], info["source"], "  [%s]" % info["error"] if info["error"] else ""))
+            for name in info["models"]:
+                print("  %s %s" % ("*" if name == info["current"] else " ", name))
+        return 0
     if args.self_test:
         log_event(logger, "self_test_start", "self-test %s started" % get_correlation_id(), repo=str(repo))
         rows = self_test(repo)
         print_self_test(rows)
+        print(status_line(repo))
         return 0 if all(row["ok"] for row in rows) else 1
     if not args.task:
         print('usage: orchestrator.py "task" [options]  (or --self-test)', file=sys.stderr)
@@ -1402,9 +1431,7 @@ def main(argv=None):
         flags=vars(args),
         repo=str(repo),
         git_head=base_commit,
-        agent0_model=LMSTUDIO_MODEL,
-        agy_model=AGY_MODEL,
-        claude_model=CLAUDE_MODEL or "(default)",
+        models=get_models(),
     )
     if not base_commit:
         log_event(logger, "run_error", "%s is not a git repository with at least one commit" % repo, level=40)
@@ -1447,6 +1474,7 @@ def main(argv=None):
         print("  %s %-6s %s via %s, %d attempt(s). Rollback: %s"
               % (result["unit"]["id"], result["status"], result["unit"]["file"], result["agent"], result["attempts"], result["rollback"]))
     print("Logs: %s and %s" % (LOG_DIR / "maid_execution.jsonl", LOG_DIR / "maid_human.log"))
+    print(status_line(repo))
     return 1 if failed else 0
 
 

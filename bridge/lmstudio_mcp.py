@@ -34,7 +34,7 @@ import sys
 import time
 import uuid
 
-from maid_common import LMSTUDIO_MODEL, get_maid_logger, lmstudio_chat, log_event
+from maid_common import get_maid_logger, get_model, lmstudio_chat, log_event
 
 SERVER_INFO = {"name": "maid-lmstudio", "version": "0.2.0"}
 
@@ -107,7 +107,7 @@ def handle(message):
             "mcp_tool_call",
             "ask_local_model called",
             call_id=call_id,
-            model=LMSTUDIO_MODEL,
+            model=get_model("local"),
             prompt=arguments.get("prompt"),
             system=arguments.get("system"),
         )
@@ -146,7 +146,7 @@ def main():
     Side effects: writes one JSON-RPC response line to stdout per request.
     @rollback: none needed; the process holds no state between requests.
     """
-    log_event(logger, "mcp_server_start", "lmstudio MCP server started", argv=sys.argv, model=LMSTUDIO_MODEL)
+    log_event(logger, "mcp_server_start", "lmstudio MCP server started", argv=sys.argv, model=get_model("local"))
     for line in sys.stdin:
         line = line.strip()
         if not line:
