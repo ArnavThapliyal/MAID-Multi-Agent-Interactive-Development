@@ -1,0 +1,5 @@
+{
+  "permissions": {
+    "allow": ["mcp__lmstudio__ask_local_model"]
+  }
+}
