@@ -218,7 +218,10 @@ def agent0_chat(messages, purpose, tools=None, tool_choice=None):
             {"role": "user", "content": "Steering from the user, to apply from now on:\n- " + "\n- ".join(steering)}
         ]
     control.set_agent("agent0", "thinking", purpose, model=get_model("local"))
-    message_id = control.add_message("orchestrator", "agent0", purpose, messages[-1]["content"])
+    shown = next(m["content"] for m in reversed(messages) if m["role"] == "user" and not m["content"].startswith("Steering from"))
+    if steering:
+        shown += "\n\n[steering] " + " | ".join(steering)
+    message_id = control.add_message("orchestrator", "agent0", purpose, shown)
     try:
         reply = lmstudio_chat(logger, messages, tools=tools, tool_choice=tool_choice, purpose=purpose)
         control.complete_message(
@@ -777,6 +780,9 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
             ok = False
         TELEMETRY.record_claude(parsed, ok)
     else:
+        # agy exits 0 even when headless mode denied a tool and it produced nothing
+        if ok and not text and "no output produced" in stderr:
+            ok = False
         TELEMETRY.record_agy(duration, ok, stdout + stderr)
     control.complete_message(message_id, text or stderr.strip() or "(no output)")
     control.set_agent(agent, "idle")
@@ -875,8 +881,9 @@ def build_worker_prompt(unit, instructions, spec_path, spec_text, repo_map, repo
         "## Isolation rules (mandatory)\n"
         "1. %s ONLY this target: %s\n"
         "2. Do not create, edit, rename or delete any other file. Other units are handled separately.\n"
-        "3. Do not run git commands that change state (commit, add, stash, reset, checkout) "
-        "and do not install packages.\n"
+        "3. You are running headless: shell commands are denied and will abort your whole reply. "
+        "Do not run, test, install or execute anything, and do not use git. Use only your "
+        "file read and file edit tools; the orchestrator runs the checks itself.\n"
         "4. Include production-grade rollback comments in what you write: a docstring or header "
         "comment with an `@rollback` line stating what state the code mutates, its side effects, "
         "and how to revert it.\n"
