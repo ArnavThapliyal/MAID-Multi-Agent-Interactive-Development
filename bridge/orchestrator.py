@@ -39,8 +39,15 @@ State mutations
       an "Execution results" section to it at the end of the run.
     * Worker CLIs create or modify files in the target repo (Phase 3).
     * Copies pre-change file contents to log/backups/<correlation-id>/ (Phase 4).
+    * Holds the live run state, sandbox grants and passed-unit checkpoints in memory.
     * Appends to log/maid_execution.jsonl and log/maid_human.log.
     The orchestrator never commits, stashes, or pushes.
+
+Sandbox
+    Every agent is confined to the target repository (--repo). Worker prompts are
+    pre-scanned for outside paths, and workers can call the MCP tool
+    `request_outside_access`; either way the user must choose Approve Once, Approve
+    for Session, or Deny & Constrain to Repo. See bridge/maid_runtime.py.
 
 Side effects
     Prompts sent through ask_agy and ask_claude leave this machine. Each worker call
@@ -66,6 +73,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -76,6 +84,7 @@ from maid_common import (
     REPO_ROOT,
     TELEMETRY,
     Telemetry,
+    add_stream_listener,
     discover_models,
     get_correlation_id,
     get_maid_logger,
@@ -89,6 +98,7 @@ from maid_common import (
     set_model,
     status_line,
 )
+from maid_runtime import RunControl, RunHalted, SandboxGate
 
 AGY_BIN = os.getenv("MAID_AGY_BIN", "agy")
 AGY_TIMEOUT = os.getenv("MAID_AGY_TIMEOUT", "10m")
@@ -153,7 +163,71 @@ WORKER_TOOLS = [
     },
 ]
 
+SANDBOX_TOOL = "request_outside_access"
+CLAUDE_ALLOWED_TOOLS = "mcp__lmstudio__ask_local_model,mcp__lmstudio__%s" % SANDBOX_TOOL
+POLL_SECONDS = 0.3
+
 logger = get_maid_logger("orchestrator", console="stderr")
+
+# The driver of this process: a terminal by default, the dashboard when maid_ui.py
+# replaces it with set_control(). One run at a time per process.
+control = RunControl()
+# Sandbox gate of the run in progress (None outside a run, e.g. in unit tests)
+gate = None
+# Checkpoints of units that passed in this process, for rollback_passed_unit()
+UNIT_STATES = {}
+
+
+def set_control(new_control):
+    """Replace the run driver (used by bridge/maid_ui.py) and return it.
+
+    State mutations: rebinds the module-level `control`.
+    @rollback: `set_control(RunControl())` restores terminal behaviour.
+    """
+    global control
+    control = new_control
+    return control
+
+
+def _forward_stream(kind, text):
+    """Forward Agent 0's streamed tokens to the current driver.
+
+    @rollback: none needed.
+    """
+    control.chunk("agent0", kind, text)
+
+
+add_stream_listener(_forward_stream)
+
+
+def agent0_chat(messages, purpose, tools=None, tool_choice=None):
+    """Call Agent 0 with the run's bookkeeping around it.
+
+    Honours pause/halt, shows Agent 0 as "thinking" with its target, records the
+    exact prompt and raw reply for the inspector, and injects any steering text the
+    user queued for Agent 0.
+
+    Raises: RunHalted if the user halted the run; otherwise as lmstudio_chat().
+    Side effects: one Agent 0 call (logged in full, streamed live).
+    @rollback: none needed.
+    """
+    control.checkpoint()
+    steering = control.take_steer("agent0")
+    if steering:
+        messages = list(messages) + [
+            {"role": "user", "content": "Steering from the user, to apply from now on:\n- " + "\n- ".join(steering)}
+        ]
+    control.set_agent("agent0", "thinking", purpose, model=get_model("local"))
+    message_id = control.add_message("orchestrator", "agent0", purpose, messages[-1]["content"])
+    try:
+        reply = lmstudio_chat(logger, messages, tools=tools, tool_choice=tool_choice, purpose=purpose)
+        control.complete_message(
+            message_id,
+            (reply.get("content") or "").strip() or json.dumps(reply.get("tool_calls") or [], indent=2),
+        )
+        return reply
+    finally:
+        control.set_agent("agent0", "idle")
 
 
 # --------------------------------------------------------------------------- #
@@ -290,7 +364,7 @@ def agent0_json(messages, validate, purpose, attempts=3):
     conversation = list(messages)
     error = None
     for attempt in range(1, attempts + 1):
-        reply = lmstudio_chat(logger, conversation, purpose="%s (attempt %d)" % (purpose, attempt))
+        reply = agent0_chat(conversation, "%s (attempt %d)" % (purpose, attempt))
         content = reply.get("content") or ""
         try:
             return validate(extract_json(content))
@@ -317,9 +391,9 @@ def clarify(task, repo_map):
 
     Returns: a list of {"question", "answer"} dicts (empty if nothing was unclear).
 
-    Side effects: one Agent 0 call; prints questions to stdout and reads answers from
-        stdin. If stdin is closed, the unanswered questions are recorded as such and
-        Agent 0 is told to use its judgement.
+    Side effects: one Agent 0 call; the questions go to the user through the run
+        driver (terminal prompt or dashboard cards). Unanswered questions are recorded
+        as such and Agent 0 is told to use its judgement.
     @rollback: none needed; nothing is written outside the logs.
     """
 
@@ -350,16 +424,11 @@ def clarify(task, repo_map):
     )
     log_event(logger, "clarify_questions", "%d clarifying question(s)" % len(questions), questions=questions)
 
-    clarifications = []
-    for number, question in enumerate(questions, 1):
-        print("\n[Agent 0] Question %d/%d: %s" % (number, len(questions), question))
-        try:
-            answer = input("> ").strip()
-        except EOFError:
-            answer = ""
-        clarifications.append(
-            {"question": question, "answer": answer or "(no answer given; use your best judgement)"}
-        )
+    answers = control.ask_questions(questions) if questions else []
+    clarifications = [
+        {"question": question, "answer": (answer or "").strip() or "(no answer given; use your best judgement)"}
+        for question, answer in zip(questions, list(answers) + [""] * len(questions))
+    ]
     if clarifications:
         log_event(logger, "clarify_answers", "clarifications recorded", clarifications=clarifications)
     return clarifications
@@ -556,13 +625,25 @@ def write_spec(repo, plan, text):
 # --------------------------------------------------------------------------- #
 
 
+def _pump(stream, sink, agent, name):
+    """Read a subprocess pipe line by line into `sink`, publishing each line live.
+
+    Runs in a daemon thread, one per pipe.
+    @rollback: none needed.
+    """
+    for line in iter(stream.readline, ""):
+        sink.append(line)
+        control.chunk(agent, name, line)
+    stream.close()
+
+
 def run_cli(agent, prompt, repo, allow_edits, purpose):
     """Run one headless worker CLI call and return its outcome.
 
     Args:
         agent: "agy" or "claude".
         prompt: the exact prompt to send.
-        repo: working directory for the CLI.
+        repo: working directory for the CLI, and the root of its sandbox.
         allow_edits: True lets the CLI write files (agy `--mode accept-edits`,
             claude `--permission-mode acceptEdits`). False leaves it read-only,
             because headless mode denies anything that needs a permission prompt.
@@ -570,25 +651,38 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
 
     Returns: dict with ok, text (the agent's reply), returncode, stdout, stderr, duration_s.
 
+    Sandbox: the CLI runs with `repo` as its working directory. The only extra
+        directories it gets are those the user approved through the sandbox gate,
+        passed with `--add-dir`. While the CLI runs, outside-access requests it files
+        through the MCP tool are put to the user.
+
     State mutations: with allow_edits=True the worker may change files in `repo`.
         Callers must take a checkpoint() first.
-    Side effects: the prompt is sent to the agent's cloud service. Logs the exact
-        prompt, argv flags, duration, stdout, stderr and HEAD before/after.
+    Side effects: the prompt is sent to the agent's cloud service. Output is
+        published live. Logs the exact prompt, argv flags, duration, stdout, stderr
+        and HEAD before/after. Updates TELEMETRY.
+    Raises: RunHalted if the user halts the run (the subprocess is terminated).
     @rollback: restore from the caller's checkpoint with rollback_unit().
     """
+    control.checkpoint()
+    granted = gate.granted_dirs() if gate else []
     if agent == "agy":
         # Invariant: models are read at call time, so a runtime switch applies to the next call
         flags = ["--model", get_model("agy"), "--print-timeout", AGY_TIMEOUT]
         if allow_edits:
             flags += ["--mode", "accept-edits"]
+        for directory in granted:
+            flags += ["--add-dir", directory]
         argv = [AGY_BIN, "--print", prompt] + flags
     else:
-        # Per-call allow rule, so the reverse bridge works without editing user settings
-        flags = ["--output-format", "json", "--allowedTools", "mcp__lmstudio__ask_local_model"]
+        # Per-call allow rules, so the MCP tools work without editing user settings
+        flags = ["--output-format", "json", "--allowedTools", CLAUDE_ALLOWED_TOOLS]
         if allow_edits:
             flags += ["--permission-mode", "acceptEdits"]
         if get_model("claude"):
             flags += ["--model", get_model("claude")]
+        for directory in granted:
+            flags += ["--add-dir", directory]
         argv = [CLAUDE_BIN, "-p", prompt] + flags
 
     head_before = git_head(repo)
@@ -601,32 +695,75 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
         binary=argv[0],
         flags=flags,
         allow_edits=allow_edits,
+        sandbox_root=str(repo),
+        sandbox_granted_dirs=granted,
         cwd=str(repo),
         git_head_before=head_before,
         prompt=prompt,
     )
+    control.set_agent(agent, "coding" if allow_edits else "reviewing", purpose, model=get_model(agent) or "default")
+    message_id = control.add_message("agent0", agent, purpose, prompt)
     started = time.monotonic()
-    # The worker (and any MCP server it starts) logs under the same correlation ID
-    environment = dict(os.environ, MAID_CORRELATION_ID=get_correlation_id())
+    # The worker (and the MCP server it starts) logs under the same correlation ID
+    # and knows which repository it is confined to.
+    environment = dict(
+        os.environ, MAID_CORRELATION_ID=get_correlation_id(), MAID_REPO_ROOT=str(repo), MAID_AGENT=agent
+    )
+    out_lines, err_lines = [], []
+    halted = timed_out = False
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             argv,
             cwd=str(repo),
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            timeout=WORKER_TIMEOUT,
+            text=True,
             env=environment,
         )
-        returncode, stdout, stderr = completed.returncode, completed.stdout, completed.stderr
-    except subprocess.TimeoutExpired as expired:
-        returncode = -1
-        stdout = expired.stdout if isinstance(expired.stdout, str) else ""
-        stderr = "timed out after %.0fs" % WORKER_TIMEOUT
     except OSError as error:
-        returncode, stdout, stderr = -1, "", "could not start %s: %r" % (argv[0], error)
+        returncode, err_lines = -1, ["could not start %s: %r" % (argv[0], error)]
+    else:
+        control.register_process(process)
+        pumps = [
+            threading.Thread(target=_pump, args=(process.stdout, out_lines, agent, "stdout"), daemon=True),
+            threading.Thread(target=_pump, args=(process.stderr, err_lines, agent, "stderr"), daemon=True),
+        ]
+        for pump in pumps:
+            pump.start()
+        try:
+            while process.poll() is None:
+                if control.halted:
+                    halted = True
+                    process.terminate()
+                    break
+                if time.monotonic() - started > WORKER_TIMEOUT:
+                    timed_out = True
+                    process.kill()
+                    break
+                if gate:
+                    gate.serve_pending(waiting_agent=agent)
+                time.sleep(POLL_SECONDS)
+        except KeyboardInterrupt:
+            process.terminate()
+            raise
+        finally:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            for pump in pumps:
+                pump.join(timeout=5)
+            control.register_process(None)
+        returncode = -1 if timed_out else process.returncode
+        if timed_out:
+            err_lines.append("timed out after %.0fs\n" % WORKER_TIMEOUT)
+    if gate:
+        # Invariant: an Approve Once grant covers exactly one worker call that could use it
+        gate.consume_once(granted)
+    stdout, stderr = "".join(out_lines), "".join(err_lines)
 
-    ok = returncode == 0
+    ok = returncode == 0 and not halted
     text = stdout.strip()
     duration = round(time.monotonic() - started, 3)
     if agent == "claude":
@@ -641,6 +778,8 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
         TELEMETRY.record_claude(parsed, ok)
     else:
         TELEMETRY.record_agy(duration, ok, stdout + stderr)
+    control.complete_message(message_id, text or stderr.strip() or "(no output)")
+    control.set_agent(agent, "idle")
     log_event(
         logger,
         "cli_result",
@@ -649,6 +788,7 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
         agent=agent,
         purpose=purpose,
         ok=ok,
+        halted=halted,
         returncode=returncode,
         duration_s=duration,
         git_head_before=head_before,
@@ -656,6 +796,8 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
         stdout=stdout,
         stderr=stderr,
     )
+    if halted:
+        raise RunHalted("run halted by the user during %s" % purpose)
     return {"ok": ok, "text": text, "returncode": returncode, "stdout": stdout, "stderr": stderr, "duration_s": duration}
 
 
@@ -685,12 +827,11 @@ def route_unit(plan, unit, repo_map, feedback):
             "Address this in the new prompt. You may switch to the other agent." % feedback
         )
     try:
-        reply = lmstudio_chat(
-            logger,
+        reply = agent0_chat(
             [{"role": "system", "content": AGENT0_SYSTEM}, {"role": "user", "content": request}],
+            "route %s" % unit["id"],
             tools=WORKER_TOOLS,
             tool_choice="required",
-            purpose="route %s" % unit["id"],
         )
         call = (reply.get("tool_calls") or [])[0]["function"]
         arguments = json.loads(call["arguments"])
@@ -716,11 +857,15 @@ def route_unit(plan, unit, repo_map, feedback):
     return choice
 
 
-def build_worker_prompt(unit, instructions, spec_path, spec_text, repo_map, repo):
+def build_worker_prompt(unit, instructions, spec_path, spec_text, repo_map, repo, denied_paths=(), steering=()):
     """Wrap Agent 0's instructions with the isolation rules, the spec and the repo map.
 
     Invariant: every worker call carries the same isolation rules, the full spec and
     the repo map, whatever Agent 0 wrote.
+
+    Args:
+        denied_paths: outside paths the user refused; the worker is told to avoid them.
+        steering: text the user queued for this worker, injected as extra context.
 
     @rollback: none (pure).
     """
@@ -735,7 +880,11 @@ def build_worker_prompt(unit, instructions, spec_path, spec_text, repo_map, repo
         "4. Include production-grade rollback comments in what you write: a docstring or header "
         "comment with an `@rollback` line stating what state the code mutates, its side effects, "
         "and how to revert it.\n"
-        "5. Match the style of the surrounding code. When done, reply with a short summary of what you changed.\n\n"
+        "5. Match the style of the surrounding code. When done, reply with a short summary of what you changed.\n"
+        "6. SANDBOX: you are confined to the repository root %s. Do not read, write or execute anything "
+        "outside it. If the unit truly cannot be done without an outside path, call the MCP tool "
+        "`%s` (server `lmstudio`) with target_path, reason and goal_impact, and wait for the "
+        "user's decision. If it is denied, finish the unit inside the repository.\n%s%s\n"
         "## Assigned unit (%s)\n%s\n\n"
         "## Instructions from Agent 0\n%s\n\n"
         "## Task spec (%s)\n%s\n\n"
@@ -743,6 +892,10 @@ def build_worker_prompt(unit, instructions, spec_path, spec_text, repo_map, repo
         % (
             unit["action"].capitalize(),
             target,
+            repo,
+            SANDBOX_TOOL,
+            "".join("   DENIED by the user, do not touch: %s\n" % path for path in denied_paths),
+            "\n## Steering from the user\n%s\n" % "\n".join("- " + text for text in steering) if steering else "",
             unit["id"],
             json.dumps(unit, indent=2),
             instructions,
@@ -1001,6 +1154,7 @@ def verify_unit(repo, unit, state, worker_agent, args):
     touched = touched_paths(state["before"], snapshot(repo))
     after_text = read_text(repo / file)
     checks = []
+    control.update_unit(unit["id"], column="review", status="verifying")
 
     def record(name, ok, detail):
         checks.append({"name": name, "ok": ok, "detail": detail})
@@ -1033,8 +1187,10 @@ def verify_unit(repo, unit, state, worker_agent, args):
             "b/" + file,
         )
     )
+    control.update_unit(unit["id"], diff=diff, checks=list(checks))
     if passed and not args.no_review:
         passed = record("review", *review_diff(repo, unit, diff, worker_agent))
+    control.update_unit(unit["id"], checks=list(checks), status="verified" if passed else "failed checks")
 
     log_event(
         logger,
@@ -1069,28 +1225,47 @@ def execute_unit(plan, unit, repo, repo_map, spec_path, args, route=None):
     feedback = ""
     agent, checks = unit["suggested_agent"], []
     for attempt in range(1, args.max_retries + 2):
+        control.update_unit(unit["id"], column="in_progress", status="routing", attempt=attempt)
         agent, instructions, _ = (route or route_unit)(plan, unit, repo_map, feedback)
         print("[%s] attempt %d -> %s: %s %s" % (unit["id"], attempt, agent, unit["action"], unit["file"]))
+        control.update_unit(unit["id"], agent=agent, status="coding")
+        # Sandbox gate: outside paths in the instructions need the user's decision before dispatch
+        denied = gate.prescan(instructions, requester="agent0 -> %s" % agent, waiting_agent=agent)[1] if gate else []
         # Invariant: the checkpoint is taken after routing and immediately before the worker runs
         state = checkpoint(repo, unit, attempt)
-        prompt = build_worker_prompt(unit, instructions, spec_path, read_text(spec_path), repo_map, repo)
-        result = run_cli(agent, prompt, repo, allow_edits=True, purpose="execute %s" % unit["id"])
-        passed, checks, touched = verify_unit(repo, unit, state, agent, args)
+        prompt = build_worker_prompt(
+            unit, instructions, spec_path, read_text(spec_path), repo_map, repo,
+            denied_paths=denied, steering=control.take_steer(agent),
+        )
+        try:
+            result = run_cli(agent, prompt, repo, allow_edits=True, purpose="execute %s" % unit["id"])
+            passed, checks, touched = verify_unit(repo, unit, state, agent, args)
+        except (RunHalted, KeyboardInterrupt):
+            # Invariant: a halted run leaves no half-finished unit behind
+            rollback_unit(repo, unit, state, touched_paths(state["before"], snapshot(repo)))
+            control.update_unit(unit["id"], column="backlog", status="halted and rolled back")
+            raise
         if passed:
             command = rollback_command(repo, unit, state)
+            UNIT_STATES[unit["id"]] = {"repo": repo, "unit": unit, "state": state}
             log_event(logger, "unit_passed", "%s passed" % unit["id"], unit=unit["id"], agent=agent, attempt=attempt, rollback_command=command)
             print("[%s] passed. Rollback: %s" % (unit["id"], command))
             print(status_line(repo))
+            control.update_unit(unit["id"], column="done", status="passed", rollback=command)
             return {"unit": unit, "status": "passed", "agent": agent, "attempts": attempt, "checks": checks, "rollback": command}
 
         failures = "; ".join("%s: %s" % (check["name"], check["detail"]) for check in checks if not check["ok"])
         if not result["ok"]:
             failures += "; worker CLI error: %s" % (result["stderr"].strip() or result["text"])[:1000]
+        if gate and gate.granted_dirs():
+            failures += "; the user has since granted access to: %s" % ", ".join(gate.granted_dirs())
         rollback_unit(repo, unit, state, touched)
         print("[%s] attempt %d FAILED and was rolled back: %s" % (unit["id"], attempt, failures[:300]))
+        control.update_unit(unit["id"], column="in_progress", status="rolled back, retrying")
         feedback = failures
 
     log_event(logger, "unit_failed", "%s failed after %d attempt(s)" % (unit["id"], args.max_retries + 1), level=40, unit=unit["id"], last_failure=feedback)
+    control.update_unit(unit["id"], column="backlog", status="failed and rolled back")
     return {
         "unit": unit,
         "status": "failed",
@@ -1099,6 +1274,26 @@ def execute_unit(plan, unit, repo, repo_map, spec_path, args, route=None):
         "checks": checks,
         "rollback": "already rolled back automatically",
     }
+
+
+def rollback_passed_unit(unit_id):
+    """Undo a unit that passed earlier in this process (the dashboard's Rollback button).
+
+    Restores the unit's file to the state checkpointed just before the worker ran.
+
+    Returns: a short description of what was done.
+    Raises: KeyError if the unit did not pass in this process (use the printed
+        rollback command instead).
+
+    State mutations: overwrites or deletes the unit's file; see restore_path().
+    @rollback: not reversible by this tool; the worker's version remains in the
+        run's `verification` log record (field `diff`).
+    """
+    entry = UNIT_STATES.pop(unit_id)
+    action = restore_path(entry["repo"], entry["unit"]["file"], entry["state"])
+    log_event(logger, "unit_rolled_back", "%s rolled back on request (%s)" % (unit_id, action), level=30, unit=unit_id, file=entry["unit"]["file"], action=action)
+    control.update_unit(unit_id, column="backlog", status="rolled back by user", rollback="")
+    return "%s: %s" % (entry["unit"]["file"], action)
 
 
 def append_results(spec_path, results, plan):
@@ -1231,12 +1426,11 @@ def _dispatch_via_agent0(tool, request):
     Side effects: one Agent 0 call.
     @rollback: none needed.
     """
-    reply = lmstudio_chat(
-        logger,
+    reply = agent0_chat(
         [{"role": "system", "content": AGENT0_SYSTEM}, {"role": "user", "content": request}],
+        "self-test dispatch via %s" % tool["function"]["name"],
         tools=[tool],
         tool_choice="required",
-        purpose="self-test dispatch via %s" % tool["function"]["name"],
     )
     try:
         call = (reply.get("tool_calls") or [])[0]["function"]
@@ -1435,16 +1629,28 @@ def main(argv=None):
     )
     if not base_commit:
         log_event(logger, "run_error", "%s is not a git repository with at least one commit" % repo, level=40)
+        control.set_run(status="failed", error="%s is not a git repository with at least one commit" % repo)
         return 2
 
-    results, spec_path = [], None
+    global gate
+    results, spec_path, plan = [], None, None
+    control.reset(args.task, repo)
+    control.set_models(get_models())
+    # Invariant: every agent of this run is confined to `repo` unless the user approves otherwise
+    gate = SandboxGate(repo, control)
+    UNIT_STATES.clear()
     try:
         repo_map = build_repo_map(repo)
+        control.set_run(status="clarifying")
         clarifications = [] if args.no_clarify else clarify(args.task, repo_map)
+        control.set_run(status="planning")
         plan = generate_plan(args.task, clarifications, repo_map, repo, args.max_units)
         spec_path = write_spec(repo, plan, render_spec(args.task, clarifications, plan, repo, base_commit))
+        control.set_units(plan["units"])
+        control.set_run(spec_path=str(spec_path.relative_to(repo)))
         print("\nSpec: %s (%d unit(s))" % (spec_path.relative_to(repo), len(plan["units"])))
         if not args.plan_only:
+            control.set_run(status="executing")
             # The spec now exists, so workers see it in the repo map too
             repo_map = build_repo_map(repo)
             for unit in plan["units"]:
@@ -1453,10 +1659,21 @@ def main(argv=None):
                 if results[-1]["status"] != "passed":
                     break
             append_results(spec_path, results, plan)
+    except (RunHalted, KeyboardInterrupt) as halt:
+        log_event(logger, "run_halted", "run halted: %s" % (halt or "interrupted"), level=30, git_head=git_head(repo))
+        if spec_path and plan:
+            append_results(spec_path, results, plan)
+        control.set_run(status="halted", error=str(halt) or "interrupted")
+        print("\nRun %s halted; the unit in progress was rolled back." % get_correlation_id())
+        return 130
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         log_event(logger, "run_error", "run aborted: %s" % error, level=40, error=repr(error))
         logger.debug("traceback", exc_info=True)
+        control.set_run(status="failed", error=str(error))
         return 2
+    finally:
+        for key in ("agent0", "agy", "claude"):
+            control.set_agent(key, "idle")
 
     failed = [result for result in results if result["status"] != "passed"]
     log_event(
@@ -1474,7 +1691,8 @@ def main(argv=None):
         print("  %s %-6s %s via %s, %d attempt(s). Rollback: %s"
               % (result["unit"]["id"], result["status"], result["unit"]["file"], result["agent"], result["attempts"], result["rollback"]))
     print("Logs: %s and %s" % (LOG_DIR / "maid_execution.jsonl", LOG_DIR / "maid_human.log"))
-    print(status_line(repo))
+    print(status_line(repo, control.snapshot()["sandbox"]))
+    control.set_run(status="failed" if failed else "done")
     return 1 if failed else 0
 
 

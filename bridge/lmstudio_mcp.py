@@ -1,8 +1,13 @@
 """MCP stdio server that exposes the LM Studio local model (Agent 0) to other agents.
 
 Purpose
-    Gives agy and Claude Code one tool, `ask_local_model`, which sends a prompt to
-    the model served by LM Studio and returns its reply.
+    Gives agy and Claude Code two tools:
+      * `ask_local_model`         sends a prompt to the model served by LM Studio and
+                                  returns its reply.
+      * `request_outside_access`  asks the user, through the orchestrator's sandbox
+                                  gate, for access to a path outside the repository.
+                                  It only works inside an orchestrated run; anywhere
+                                  else it answers "deny".
 
 Registration
     agy:          agy mcp add lmstudio /usr/bin/python3 /abs/path/bridge/lmstudio_mcp.py
@@ -22,7 +27,9 @@ State mutations
     log/maid_human.log.
 
 Side effects
-    One HTTP request to LM Studio per `ask_local_model` call.
+    One HTTP request to LM Studio per `ask_local_model` call. A
+    `request_outside_access` call writes a request file under log/sandbox/ and waits
+    (MAID_SANDBOX_TIMEOUT seconds, default 300) for the user's decision.
 
 @rollback
     Unregister with `agy mcp remove lmstudio`, and delete the "lmstudio" entry from
@@ -30,13 +37,17 @@ Side effects
     `git checkout -- bridge/lmstudio_mcp.py`. Standard library only, Python 3.9+.
 """
 import json
+import os
 import sys
 import time
 import uuid
 
 from maid_common import get_maid_logger, get_model, lmstudio_chat, log_event
+from maid_runtime import is_path_within_repo, permission_payload, submit_outside_request
 
-SERVER_INFO = {"name": "maid-lmstudio", "version": "0.2.0"}
+SANDBOX_TIMEOUT = float(os.getenv("MAID_SANDBOX_TIMEOUT", "300"))
+
+SERVER_INFO = {"name": "maid-lmstudio", "version": "0.3.0"}
 
 TOOLS = [
     {
@@ -54,7 +65,24 @@ TOOLS = [
             },
             "required": ["prompt"],
         },
-    }
+    },
+    {
+        "name": "request_outside_access",
+        "description": (
+            "Ask the user for permission to read, write or execute a path OUTSIDE the "
+            "repository you are confined to. Blocks until the user answers. Returns "
+            "approve_once, approve_session or deny. If denied, stay inside the repository."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_path": {"type": "string", "description": "The exact outside path you need."},
+                "reason": {"type": "string", "description": "Why you need access to this path."},
+                "goal_impact": {"type": "string", "description": "How access helps achieve the task goal."},
+            },
+            "required": ["target_path", "reason", "goal_impact"],
+        },
+    },
 ]
 
 # console=None: stdout belongs to the MCP protocol
@@ -74,6 +102,30 @@ def ask_local_model(prompt, system=None):
     messages.append({"role": "user", "content": prompt})
     message = lmstudio_chat(logger, messages, purpose="mcp ask_local_model")
     return (message.get("content") or "").strip()
+
+
+def request_outside_access(target_path, reason, goal_impact):
+    """File a sandbox permission request with the orchestrator and return its answer as text.
+
+    Outside an orchestrated run (no MAID_REPO_ROOT in the environment) there is nobody
+    to ask, so the answer is "deny".
+
+    State mutations: writes a request file under log/sandbox/<correlation-id>/.
+    Side effects: blocks up to SANDBOX_TIMEOUT seconds; logs the request and decision.
+    @rollback: none needed; an unanswered request grants nothing.
+    """
+    repo = os.getenv("MAID_REPO_ROOT")
+    requester = os.getenv("MAID_AGENT", "worker")
+    if not repo:
+        decision = {"decision": "deny", "note": "No MAID orchestrator is running this session, so nobody can approve."}
+    elif is_path_within_repo(target_path, repo):
+        decision = {"decision": "not_needed", "note": "That path is inside the repository; no approval is needed."}
+    else:
+        payload = permission_payload(target_path, reason, goal_impact, requester)
+        log_event(logger, "mcp_sandbox_request", "%s asks for %s" % (requester, payload["target_path"]), **payload)
+        decision = submit_outside_request(payload, SANDBOX_TIMEOUT)
+    log_event(logger, "mcp_sandbox_decision", "%s -> %s" % (target_path, decision["decision"]), target_path=target_path, **decision)
+    return "decision: %s\n%s" % (decision["decision"], decision.get("note", ""))
 
 
 def handle(message):
@@ -97,9 +149,15 @@ def handle(message):
     if method == "tools/list":
         return {"tools": TOOLS}
     if method == "tools/call":
+        arguments = params.get("arguments") or {}
+        if params.get("name") == "request_outside_access":
+            try:
+                text = request_outside_access(arguments["target_path"], arguments.get("reason"), arguments.get("goal_impact"))
+            except (KeyError, OSError, ValueError) as error:
+                return {"content": [{"type": "text", "text": "decision: deny\nrequest failed: %r" % error}], "isError": True}
+            return {"content": [{"type": "text", "text": text}]}
         if params.get("name") != "ask_local_model":
             raise ValueError("Unknown tool: %s" % params.get("name"))
-        arguments = params.get("arguments") or {}
         call_id = uuid.uuid4().hex[:8]
         started = time.monotonic()
         log_event(
