@@ -214,6 +214,19 @@ class StatusLineTest(unittest.TestCase):
         self.assertEqual(snapshot["agy"]["avg_latency_s"], 10.0)
         self.assertEqual(snapshot["claude"]["output_tokens"], 186)
 
+    def test_per_call_history_and_generation_speed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry = self.telemetry(directory)
+            telemetry.record_local({"prompt_tokens": 100, "completion_tokens": 90}, 10.0, "m", ttft_s=1.0, purpose="plan")
+            telemetry.record_claude({"total_cost_usd": 0.05}, True, 30.0, "review U1")
+            telemetry.record_agy(12.0, False, "boom", "execute U1")
+            snapshot = telemetry.snapshot()
+        self.assertEqual([(call["agent"], call["purpose"], call["ok"]) for call in snapshot["calls"]],
+                         [("local", "plan", True), ("claude", "review U1", True), ("agy", "execute U1", False)])
+        self.assertEqual((snapshot["calls"][0]["tok_s"], snapshot["calls"][0]["ttft_s"]), (10.0, 1.0))
+        self.assertEqual(snapshot["local"]["last_ttft_s"], 1.0)
+        self.assertEqual(snapshot["calls"][1]["cost_usd"], 0.05)
+
     def test_rate_limit_detection(self):
         self.assertTrue(maid_common.detect_rate_limit("HTTP 429 Too Many Requests"))
         self.assertTrue(maid_common.detect_rate_limit("You have hit your usage limit"))
@@ -227,6 +240,57 @@ class StatusLineTest(unittest.TestCase):
             self.assertEqual(maid_common.read_claude_rate_limits(path), {"five_hour_pct": 42})
             path.write_text("not json")
             self.assertEqual(maid_common.read_claude_rate_limits(path), {})
+
+
+class ResourceSamplerTest(unittest.TestCase):
+    PS = (
+        " 85.2 23000000 /Applications/LM Studio.app/Contents/MacOS/LM Studio\n"
+        "  3.1   512000 /Users/x/.lmstudio/extensions/backends/vendor/node llmworker.js\n"
+        "  0.4    40960 python3 bridge/maid_ui.py --port 8765\n"
+        "  1.0    81920 /Users/x/.local/bin/agy --print hello --model m\n"
+        "  2.5   204800 /opt/homebrew/bin/claude -p hi --output-format json\n"
+        " 12.0   100000 /Applications/Safari.app/Contents/MacOS/Safari\n"
+        "  9.0   900000 /opt/homebrew/bin/claude --resume\n"
+        "garbage line\n"
+    )
+    VM_STAT = (
+        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+        "Pages free:                               64000.\n"
+        "Pages active:                            640000.\n"
+        "Pages wired down:                        128000.\n"
+        "Pages occupied by compressor:             32000.\n"
+    )
+
+    def test_parse_ps_groups_only_maid_processes(self):
+        groups = maid_common.parse_ps(self.PS)
+        self.assertEqual(groups["lmstudio"], {"cpu": 88.3, "rss_mb": 22960.9, "procs": 2})
+        self.assertEqual(groups["dashboard"], {"cpu": 0.4, "rss_mb": 40.0, "procs": 1})
+        self.assertEqual((groups["agy"]["procs"], groups["claude"]["rss_mb"], groups["orchestrator"]["procs"]), (1, 200.0, 0))
+        self.assertEqual(sorted(maid_common.parse_ps("")), sorted(maid_common.PROCESS_GROUPS))
+
+    def test_parse_vm_stat(self):
+        self.assertEqual(
+            maid_common.parse_vm_stat(self.VM_STAT),
+            {"free_mb": 1000, "active_mb": 10000, "wired_mb": 2000, "compressed_mb": 500},
+        )
+        self.assertEqual(maid_common.parse_vm_stat("MemTotal: 1 kB"), {})
+
+    def test_sampler_records_and_survives_missing_tools(self):
+        def run(argv, **kwargs):
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 0, self.PS, "")
+            raise FileNotFoundError("vm_stat")
+
+        sampler = maid_common.ResourceSampler(log=False)
+        with mock.patch.object(maid_common.subprocess, "run", side_effect=run):
+            sample = sampler.sample_once()
+        self.assertEqual(sample["groups"]["lmstudio"]["procs"], 2)
+        self.assertEqual(sample["memory"], {})
+        self.assertEqual(len(sampler.samples), 1)
+        snapshot = maid_common.metrics_snapshot(sampler)
+        self.assertEqual(len(snapshot["samples"]), 1)
+        self.assertIn("local", snapshot["telemetry"])
+        self.assertNotIn("calls", snapshot["telemetry"])
 
 
 if __name__ == "__main__":

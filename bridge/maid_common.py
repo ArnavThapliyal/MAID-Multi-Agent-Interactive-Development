@@ -49,6 +49,7 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 
@@ -72,6 +73,9 @@ LMSTUDIO_REASONING = os.getenv("MAID_LMSTUDIO_REASONING", "low")
 LMSTUDIO_STREAM = os.getenv("MAID_LMSTUDIO_STREAM", "1") != "0"
 STREAM_LOG_NAME = "lmstudio_stream.log"
 TELEMETRY_NAME = "telemetry.json"
+METRICS_LOG_NAME = "metrics.jsonl"
+CALL_HISTORY = 300
+SAMPLE_HISTORY = 900
 
 DEFAULT_MODELS = {"local": "qwen/qwen3.8-27b", "agy": "gemini-3.8-flash-medium", "claude": ""}
 MODEL_ENV = {"local": "MAID_LMSTUDIO_MODEL", "agy": "MAID_AGY_MODEL", "claude": "MAID_CLAUDE_MODEL"}
@@ -89,6 +93,7 @@ __all__ = [
     "LMSTUDIO_TIMEOUT",
     "DONE",
     "TELEMETRY",
+    "ResourceSampler",
     "StreamAccumulator",
     "Telemetry",
     "add_stream_listener",
@@ -105,8 +110,11 @@ __all__ = [
     "lmstudio_chat",
     "log_event",
     "new_correlation_id",
+    "metrics_snapshot",
     "parse_agy_models",
+    "parse_ps",
     "parse_sse_line",
+    "parse_vm_stat",
     "read_claude_rate_limits",
     "set_correlation_id",
     "set_model",
@@ -446,6 +454,7 @@ def lmstudio_chat(logger, messages, tools=None, tool_choice=None, purpose="chat"
     )
     started = time.monotonic()
     usage = None
+    first_token_at = None
     with urllib.request.urlopen(request, timeout=LMSTUDIO_TIMEOUT) as response:
         if streaming:
             accumulator = StreamAccumulator()
@@ -461,6 +470,8 @@ def lmstudio_chat(logger, messages, tools=None, tool_choice=None, purpose="chat"
                 if chunk is None:
                     continue
                 for kind, text in accumulator.feed(chunk):
+                    if first_token_at is None:
+                        first_token_at = time.monotonic()
                     if kind != last_kind:
                         _stream_log("\n[%s] " % kind)
                         last_kind = kind
@@ -475,7 +486,8 @@ def lmstudio_chat(logger, messages, tools=None, tool_choice=None, purpose="chat"
             body = json.load(response)
             message, usage = body["choices"][0]["message"], body.get("usage")
     duration = time.monotonic() - started
-    TELEMETRY.record_local(usage, duration, model)
+    ttft = first_token_at - started if first_token_at is not None else None
+    TELEMETRY.record_local(usage, duration, model, ttft_s=ttft, purpose=purpose)
     log_event(
         logger,
         "lmstudio_response",
@@ -483,6 +495,7 @@ def lmstudio_chat(logger, messages, tools=None, tool_choice=None, purpose="chat"
         level=10,
         purpose=purpose,
         duration_s=round(duration, 3),
+        ttft_s=round(ttft, 3) if ttft is not None else None,
         content=message.get("content"),
         reasoning=message.get("reasoning_content"),
         tool_calls=message.get("tool_calls"),
@@ -607,6 +620,7 @@ class Telemetry:
             self.local = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "tok_s": 0.0}
             self.claude = {"calls": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "status": "idle"}
             self.agy = {"calls": 0, "latency_s": 0.0, "total_latency_s": 0.0, "status": "idle", "note": ""}
+            self.calls = deque(maxlen=CALL_HISTORY)
 
     def _agy_today(self, increment=0):
         """Read (and optionally bump) today's persisted agy call count.
@@ -626,21 +640,38 @@ class Telemetry:
                 pass
         return count
 
-    def record_local(self, usage, duration_s, model=""):
+    def _call(self, agent, purpose, duration_s, ok=True, **extra):
+        """Append one per-call record (caller holds the lock).
+
+        @rollback: none needed; the history is bounded.
+        """
+        self.calls.append(dict(extra, at=time.time(), agent=agent, purpose=purpose, duration_s=round(duration_s, 3), ok=ok))
+
+    def record_local(self, usage, duration_s, model="", ttft_s=None, purpose=""):
         """Record one LM Studio completion.
+
+        Tokens/second is generation speed: completion tokens over the time after
+        the first token arrived (or over the whole call if that is unknown).
 
         @rollback: none needed.
         """
         usage = usage or {}
         completion = usage.get("completion_tokens") or 0
+        generating = duration_s - ttft_s if ttft_s is not None and duration_s > ttft_s else duration_s
+        tok_s = completion / generating if completion and generating > 0 else 0.0
         with self._lock:
             self.local["calls"] += 1
             self.local["prompt_tokens"] += usage.get("prompt_tokens") or 0
             self.local["completion_tokens"] += completion
-            if completion and duration_s > 0:
-                self.local["tok_s"] = completion / duration_s
+            if tok_s:
+                self.local["tok_s"] = tok_s
+            self._call(
+                "local", purpose, duration_s, model=model, tok_s=round(tok_s, 2),
+                ttft_s=round(ttft_s, 3) if ttft_s is not None else None,
+                prompt_tokens=usage.get("prompt_tokens") or 0, completion_tokens=completion,
+            )
 
-    def record_claude(self, parsed, ok):
+    def record_claude(self, parsed, ok, duration_s=0.0, purpose=""):
         """Record one `claude -p --output-format json` result (cost and token usage).
 
         @rollback: none needed.
@@ -658,8 +689,9 @@ class Telemetry:
             self.claude["output_tokens"] += usage.get("output_tokens") or 0
             limited = detect_rate_limit(str(parsed.get("result") or "")) if not ok else ""
             self.claude["status"] = "rate-limited" if limited else ("ok" if ok else "error")
+            self._call("claude", purpose, duration_s, ok, cost_usd=round(parsed.get("total_cost_usd") or 0.0, 4))
 
-    def record_agy(self, duration_s, ok, output=""):
+    def record_agy(self, duration_s, ok, output="", purpose=""):
         """Record one agy call: latency, outcome, and any rate-limit message.
 
         State mutations: bumps the persisted daily count.
@@ -672,6 +704,7 @@ class Telemetry:
             self.agy["total_latency_s"] += duration_s
             self.agy["status"] = "rate-limited" if limited else ("ok" if ok else "error")
             self.agy["note"] = limited
+            self._call("agy", purpose, duration_s, ok)
         self._agy_today(1)
 
     def snapshot(self):
@@ -681,11 +714,13 @@ class Telemetry:
         """
         with self._lock:
             local, claude, agy = dict(self.local), dict(self.claude), dict(self.agy)
+            calls = list(self.calls)
+        local["last_ttft_s"] = next((call["ttft_s"] for call in reversed(calls) if call["agent"] == "local" and call.get("ttft_s") is not None), None)
         agy["calls_today"] = self._agy_today()
         agy["quota_est"] = os.getenv("MAID_AGY_QUOTA_EST", "")
         agy["avg_latency_s"] = round(agy["total_latency_s"] / agy["calls"], 1) if agy["calls"] else 0.0
         claude["rate_limits"] = read_claude_rate_limits()
-        return {"local": local, "claude": claude, "agy": agy}
+        return {"local": local, "claude": claude, "agy": agy, "calls": calls}
 
 
 TELEMETRY = Telemetry()
@@ -748,3 +783,155 @@ def status_line(repo, sandbox="LOCKED"):
     @rollback: none.
     """
     return format_status_line(TELEMETRY.snapshot(), get_models(), git_summary(repo), sandbox)
+
+
+# --------------------------------------------------------------------------- #
+# Resource sampling (live monitoring)
+# --------------------------------------------------------------------------- #
+
+PROCESS_GROUPS = ("lmstudio", "dashboard", "orchestrator", "agy", "claude")
+
+
+def classify_process(command):
+    """Map a process command line to one of PROCESS_GROUPS, or None if it is not ours.
+
+    @rollback: none (pure).
+    """
+    lowered = command.lower()
+    executable = command.split(" ", 1)[0].rsplit("/", 1)[-1].lower()
+    if "lm studio" in lowered or "/.lmstudio/" in lowered or executable.startswith("lms"):
+        return "lmstudio"
+    if "maid_ui.py" in lowered:
+        return "dashboard"
+    if "orchestrator.py" in lowered or "lmstudio_mcp.py" in lowered or "bench.py" in lowered:
+        return "orchestrator"
+    # Only headless worker calls count; an interactive agy or Claude Code session is not MAID's
+    if executable == "agy" and " --print " in command:
+        return "agy"
+    if executable == "claude" and " -p " in command:
+        return "claude"
+    return None
+
+
+def parse_ps(text):
+    """Sum CPU % and resident memory per process group from `ps -axo pcpu=,rss=,command=` output.
+
+    Returns: {group: {"cpu": percent, "rss_mb": megabytes, "procs": count}} for every
+        group in PROCESS_GROUPS (zeros when no process matched).
+
+    @rollback: none (pure).
+    """
+    groups = {name: {"cpu": 0.0, "rss_mb": 0.0, "procs": 0} for name in PROCESS_GROUPS}
+    for line in (text or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        group = classify_process(parts[2])
+        if group is None:
+            continue
+        try:
+            cpu, rss_kb = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        groups[group]["cpu"] = round(groups[group]["cpu"] + cpu, 1)
+        groups[group]["rss_mb"] = round(groups[group]["rss_mb"] + rss_kb / 1024.0, 1)
+        groups[group]["procs"] += 1
+    return groups
+
+
+def parse_vm_stat(text):
+    """Turn macOS `vm_stat` output into megabytes: free, active, wired, compressed.
+
+    Returns: {} if the output is not vm_stat's (for example on Linux).
+
+    @rollback: none (pure).
+    """
+    page = re.search(r"page size of (\d+) bytes", text or "")
+    if not page:
+        return {}
+    scale = int(page.group(1)) / (1024.0 * 1024.0)
+    wanted = {
+        "free_mb": "Pages free",
+        "active_mb": "Pages active",
+        "wired_mb": "Pages wired down",
+        "compressed_mb": "Pages occupied by compressor",
+    }
+    memory = {}
+    for key, label in wanted.items():
+        match = re.search(r"%s:\s+(\d+)" % re.escape(label), text)
+        if match:
+            memory[key] = round(int(match.group(1)) * scale)
+    return memory
+
+
+class ResourceSampler(threading.Thread):
+    """Samples CPU and memory of LM Studio, MAID and the worker CLIs in the background.
+
+    Cost: one `ps` and one `vm_stat` subprocess per interval (2 seconds by default),
+    a few milliseconds of CPU each. It never touches the model's request path.
+
+    State mutations: keeps the last SAMPLE_HISTORY samples in memory and, when
+        `log=True`, appends each one to log/metrics.jsonl (git-ignored).
+    @rollback: `stop()` ends the thread; delete log/metrics.jsonl to discard samples.
+    """
+
+    def __init__(self, interval=2.0, log=True):
+        super().__init__(daemon=True, name="maid-sampler")
+        self.interval = interval
+        self.log = log
+        self.samples = deque(maxlen=SAMPLE_HISTORY)
+        self._stop_event = threading.Event()
+
+    def sample_once(self):
+        """Take one sample and return it.
+
+        Side effects: two short subprocesses; appends to the history (and the log).
+        @rollback: none needed.
+        """
+        sample = {"at": round(time.time(), 2), "groups": parse_ps(""), "memory": {}, "load1": 0.0}
+        try:
+            listing = subprocess.run(["ps", "-axo", "pcpu=,rss=,command="], capture_output=True, text=True, timeout=5)
+            sample["groups"] = parse_ps(listing.stdout)
+            sample["memory"] = parse_vm_stat(
+                subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            sample["load1"] = round(os.getloadavg()[0], 2)
+        except OSError:
+            pass
+        sample["local_tok_s"] = round(TELEMETRY.local["tok_s"], 2)
+        self.samples.append(sample)
+        if self.log:
+            try:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                with (LOG_DIR / METRICS_LOG_NAME).open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(sample) + "\n")
+            except OSError:
+                pass
+        return sample
+
+    def run(self):
+        while not self._stop_event.wait(self.interval):
+            self.sample_once()
+
+    def stop(self):
+        """Stop sampling.
+
+        @rollback: start a new ResourceSampler.
+        """
+        self._stop_event.set()
+
+
+def metrics_snapshot(sampler=None, samples=120):
+    """Return telemetry, the per-call history and recent resource samples as one dict.
+
+    @rollback: none (read-only).
+    """
+    telemetry = TELEMETRY.snapshot()
+    return {
+        "telemetry": {key: value for key, value in telemetry.items() if key != "calls"},
+        "calls": telemetry["calls"],
+        "samples": list(sampler.samples)[-samples:] if sampler else [],
+    }

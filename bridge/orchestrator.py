@@ -786,12 +786,12 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
             ok = ok and not parsed.get("is_error", False)
         except ValueError:
             ok = False
-        TELEMETRY.record_claude(parsed, ok)
+        TELEMETRY.record_claude(parsed, ok, duration, purpose)
     else:
         # agy exits 0 even when headless mode denied a tool and it produced nothing
         if ok and not text and "no output produced" in stderr:
             ok = False
-        TELEMETRY.record_agy(duration, ok, stdout + stderr)
+        TELEMETRY.record_agy(duration, ok, stdout + stderr, purpose)
     control.complete_message(message_id, text or stderr.strip() or "(no output)")
     control.set_agent(agent, "idle")
     log_event(
