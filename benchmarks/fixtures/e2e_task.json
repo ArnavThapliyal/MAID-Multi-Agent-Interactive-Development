@@ -1,0 +1,10 @@
+{
+  "about": "Fixed two-unit task for the end-to-end benchmark. The second unit git-ignores the file the first one creates, which also guards the scope-check regression from run c7e29fedfe4b.",
+  "task": "Create the file doc/NOTES.md containing a five-line plain-language explanation of what retry with exponential backoff is. Then add the line doc/NOTES.md to .gitignore so the notes are not tracked. These are two separate units: one for doc/NOTES.md and one for .gitignore.",
+  "expected_units": 2,
+  "repo_files": {
+    "README.md": "# Bench fixture\n\nA tiny repository used by the MAID benchmark.\n",
+    "src/app.py": "def greet(name):\n    return \"Hello, %s\" % name\n",
+    ".gitignore": "__pycache__/\n*.log\n"
+  }
+}
