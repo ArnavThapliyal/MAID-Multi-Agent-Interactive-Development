@@ -66,6 +66,7 @@ class PureHelpersTest(unittest.TestCase):
         self.assertEqual((cards["U3"]["column"], cards["U3"]["status"]), ("backlog", "not run"))
         self.assertEqual(cards["U1"]["title"], "Add a retry helper")
         self.assertTrue(all(card["history"] for card in cards.values()))
+        self.assertEqual((cards["U1"]["key"], cards["U1"]["date"]), ("20260101-000000_retry.md#U1", "2026-01-01 00:00"))
 
     def test_spec_without_results_is_all_backlog(self):
         cards = maid_ui.parse_spec(SPEC.split("## Execution results")[0], "x.md")
@@ -130,6 +131,24 @@ class UIControlTest(unittest.TestCase):
             self.assertEqual(decisions, ["approve_session"])
             self.assertEqual(self.control.snapshot()["sandbox"], "LOCKED")
 
+    def test_stream_chunks_are_coalesced_into_one_event(self):
+        bus = maid_ui.EventBus()
+        control = maid_ui.UIControl(bus)
+        subscriber = bus.subscribe()
+        for token in ("Let ", "me ", "think"):
+            control.chunk("agent0", "reasoning", token)
+        control.chunk("agent0", "content", "42")
+        control.chunk("agy", "stdout", "done\n")
+        control.flush_chunks()
+        events = []
+        while not subscriber.empty():
+            events.append(subscriber.get_nowait())
+        chunk_events = [payload for kind, payload in events if kind == "chunks"]
+        merged = [chunk for payload in chunk_events for chunk in payload]
+        self.assertEqual(merged, [["agent0", "reasoning", "Let me think"], ["agent0", "content", "42"], ["agy", "stdout", "done\n"]])
+        self.assertLessEqual(len(chunk_events), 2)
+        self.assertEqual(control.flush_chunks(), 0)
+
     def test_halt_releases_pending_prompts_safely(self):
         results = []
         worker = threading.Thread(target=lambda: results.append(self.control.ask_permission({"id": "x"})))
@@ -153,13 +172,14 @@ class HttpTest(unittest.TestCase):
         maid_common.git(cls.repo, "-c", "user.name=maid", "-c", "user.email=maid@localhost", "commit", "-q", "-m", "init")
         cls.patches = [
             mock.patch.object(maid_ui, "PROJECTS_FILE", Path(cls.directory.name) / "projects.json"),
+            mock.patch.object(maid_ui, "HIDDEN_FILE", Path(cls.directory.name) / "hidden.json"),
             mock.patch.object(maid_ui, "discover_models", return_value={
                 agent: {"models": ["m1", "m2"], "current": "m1", "source": "test", "error": ""} for agent in ("local", "agy", "claude")
             }),
         ]
         for patch in cls.patches:
             patch.start()
-        cls.app = maid_ui.App(cls.repo)
+        cls.app = maid_ui.App(cls.repo, sample=False)
         maid_ui.Handler.app = cls.app
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), maid_ui.Handler)
         cls.server.daemon_threads = True
@@ -201,7 +221,7 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(maid_ui.TOKEN, body)
         self.assertNotIn("__TOKEN__", body)
-        for zone in ('id="board"', 'id="deck"', 'id="drawer"', 'id="foot"', "TERMINAL / STREAM", "GIT DIFF", "MESSAGES", "TRACES"):
+        for zone in ('id="board"', 'id="deck"', 'id="drawer"', 'id="foot"', 'id="strip"', "TERMINAL / STREAM", "GIT DIFF", "MESSAGES", "TRACES", "METRICS", "SPEC"):
             self.assertIn(zone, body)
 
     def test_state_shape_and_history_cards(self):
@@ -241,6 +261,47 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.call("/api/steer", {"agent": "claude", "text": "keep it small"})[0], 200)
         self.assertEqual(self.app.control.take_steer("claude"), ["keep it small"])
         self.assertEqual(self.call("/api/steer", {"agent": "root", "text": "x"})[0], 400)
+
+    def test_spec_endpoint_only_reads_spec_files(self):
+        status, body = self.call("/api/spec?name=20260101-000000_retry.md")
+        self.assertEqual(status, 200)
+        self.assertIn("# Task spec: Add a retry helper", json.loads(body)["text"])
+        for name in ("../../README.md", "..%2F..%2F.git%2Fconfig", "/etc/passwd", "missing.md", "", "retry.txt"):
+            self.assertEqual(self.call("/api/spec?name=" + name)[0], 404, name)
+
+    def test_hide_and_unhide_a_history_card(self):
+        key = "20260101-000000_retry.md#U2"
+        self.assertEqual(self.call("/api/hide", {"key": key, "hidden": True})[0], 200)
+        cards = {card["key"]: card for card in json.loads(self.call("/api/state")[1])["history"]}
+        self.assertTrue(cards[key]["hidden"])
+        self.assertFalse(cards["20260101-000000_retry.md#U1"]["hidden"])
+        self.assertTrue((self.repo / "doc" / "tasks" / "20260101-000000_retry.md").is_file())
+        self.assertEqual(self.call("/api/hide", {"key": key, "hidden": False})[0], 200)
+        self.assertFalse(any(card["hidden"] for card in json.loads(self.call("/api/state")[1])["history"]))
+        self.assertEqual(self.call("/api/hide", {"key": "../x#U1"})[0], 400)
+
+    def test_unit_edit_endpoint(self):
+        unit = {"id": "U1", "file": "a.py", "action": "create", "description": "old", "suggested_agent": "agy"}
+        self.app.control.set_units([unit, dict(unit, id="U2")])
+        try:
+            status, body = self.call("/api/unit", {"id": "U2", "description": "new text", "pinned_agent": "claude"})
+            self.assertEqual(status, 200)
+            self.assertEqual((json.loads(body)["unit"]["description"], json.loads(body)["unit"]["agent"]), ("new text", "claude"))
+            self.assertEqual(self.call("/api/unit", {"id": "U2", "skip": True})[0], 200)
+            self.assertEqual(self.app.control.take_unit_edits("U2"), {"description": "new text", "pinned_agent": "claude", "skip": True})
+            self.assertEqual(self.call("/api/unit", {"id": "U9", "skip": True})[0], 400)
+            self.app.control.update_unit("U1", column="in_progress", status="coding")
+            self.assertEqual(self.call("/api/unit", {"id": "U1", "description": "too late"})[0], 409)
+            self.assertEqual(self.call("/api/unit", {"id": "U2", "skip": True}, token="")[0], 403)
+        finally:
+            self.app.control.set_units([])
+
+    def test_metrics_endpoint_shape(self):
+        status, body = self.call("/api/metrics")
+        metrics = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(metrics), ["calls", "samples", "telemetry"])
+        self.assertIn("tok_s", metrics["telemetry"]["local"])
 
     def test_bad_requests_do_not_start_runs(self):
         self.assertEqual(self.call("/api/task", {"task": "   "})[0], 409)
