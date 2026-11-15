@@ -1350,7 +1350,7 @@ events.addEventListener("state", e=>{ if(!S) return; S.run = JSON.parse(e.data);
   if (tab==="diff" && changed("diffkey", [sel.unit, unit && [unit.id, unit.status, unit.has_diff, unit.checks.length]])) loadDiff(); });
 events.addEventListener("chunks", e=>{ for (const [agent,kind,text] of JSON.parse(e.data)) pushChunk(agent, kind, text); });
 events.addEventListener("trace", e=>{ if (tab==="traces" && drawerOpen()){ const pane=$("pane"); if (pane.children.length) pane.insertBefore(traceRow(JSON.parse(e.data)), pane.children[1]||null); } });
-events.addEventListener("refresh", ()=>{ refresh(); loadMetrics(); });
+events.addEventListener("refresh", ()=>refresh().then(loadMetrics));   // metrics are read against the refreshed run
 setInterval(()=>document.querySelectorAll("[data-since]").forEach(el=>el.textContent=elapsed(+el.dataset.since)), 1000);
 setInterval(()=>{ if (S && (S.busy || (drawerOpen() && tab==="metrics"))) loadMetrics(); }, 2000);
 setInterval(refresh, 20000);
