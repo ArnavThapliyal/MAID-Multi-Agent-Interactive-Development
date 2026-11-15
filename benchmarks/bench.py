@@ -613,8 +613,10 @@ class Dashboard:
     @rollback: `close()`.
     """
 
-    def __init__(self, repo, port, want_browser):
+    def __init__(self, repo, port, want_browser, sampler=None):
         self.app = maid_ui.App(repo, sample=False)
+        # Share the benchmark's sampler, so the METRICS tab shows real figures without sampling twice
+        self.app.sampler = sampler
         self.app.control = orchestrator.set_control(DashboardControl(self.app.bus))
         self.app.control.set_models(maid_common.get_models())
         maid_ui.Handler.app = self.app
@@ -750,7 +752,7 @@ def main(argv=None):
             step("b4", "workers: agy and claude round trip", lambda: b4_workers(repo, 2))
 
         monitor.phase = "dashboard-start"
-        dashboard = Dashboard(repo, args.port, not args.no_screenshots)
+        dashboard = Dashboard(repo, args.port, not args.no_screenshots, monitor.sampler)
         if not args.quick:
             def worker_started():
                 name = dashboard.shot(shots_dir, "02-running.png", "closeDrawer()", 0.6)
