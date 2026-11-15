@@ -256,6 +256,7 @@ class RunControl:
         self._paused = threading.Event()
         self._halted = threading.Event()
         self._steers = {key: [] for key in AGENT_KEYS}
+        self._unit_edits = {}
         self._process = None
         self.state = _fresh_state()
         self.streams = {key: "" for key in AGENT_KEYS}
@@ -309,6 +310,7 @@ class RunControl:
             )
             self.streams = {key: "" for key in AGENT_KEYS}
             self._steers = {key: [] for key in AGENT_KEYS}
+            self._unit_edits = {}
         self._paused.clear()
         self._halted.clear()
         self._changed()
@@ -355,6 +357,7 @@ class RunControl:
                     "id": unit["id"], "file": unit["file"], "action": unit["action"], "symbol": unit.get("symbol", ""),
                     "description": unit.get("description", ""), "agent": unit.get("suggested_agent", ""),
                     "column": "backlog", "status": "pending", "attempt": 0, "checks": [], "rollback": "", "diff": "",
+                    "pinned_agent": "",
                 }
                 for unit in units
             ]
@@ -370,6 +373,55 @@ class RunControl:
                 if unit["id"] == unit_id:
                     unit.update(fields)
         self._changed()
+
+    def edit_unit(self, unit_id, description=None, pinned_agent=None, skip=None):
+        """Change a unit that has not started yet (the card's Edit, Reassign and Skip).
+
+        Args:
+            description: new instructions for the unit, or None to leave them.
+            pinned_agent: "agy" or "claude" to force that worker, "" to let Agent 0
+                decide again, or None to leave it.
+            skip: True drops the unit from this run, False restores it, None leaves it.
+
+        Returns: the updated card.
+        Raises: KeyError for an unknown unit; ValueError if the unit already started
+            or the agent is not one of the workers.
+        State mutations: updates the card and the pending edits the orchestrator
+            applies just before it dispatches the unit.
+        @rollback: call again with the previous values.
+        """
+        with self._lock:
+            unit = next((item for item in self.state["units"] if item["id"] == unit_id), None)
+            if unit is None:
+                raise KeyError(unit_id)
+            if unit["column"] != "backlog" or unit["status"] not in ("pending", "skipped"):
+                raise ValueError("%s has already started and can no longer be edited" % unit_id)
+            edits = self._unit_edits.setdefault(unit_id, {})
+            if description is not None:
+                description = str(description).strip()
+                if not description:
+                    raise ValueError("the description cannot be empty")
+                edits["description"] = unit["description"] = description
+            if pinned_agent is not None:
+                if pinned_agent not in ("", "agy", "claude"):
+                    raise ValueError("unknown agent %r" % pinned_agent)
+                edits["pinned_agent"] = unit["pinned_agent"] = pinned_agent
+                if pinned_agent:
+                    unit["agent"] = pinned_agent
+            if skip is not None:
+                edits["skip"] = bool(skip)
+                unit["status"] = "skipped" if skip else "pending"
+            card = dict(unit)
+        self._changed()
+        return card
+
+    def take_unit_edits(self, unit_id):
+        """Return and clear the pending edits for a unit; called as it is dispatched.
+
+        @rollback: none needed.
+        """
+        with self._lock:
+            return self._unit_edits.pop(unit_id, {})
 
     def add_message(self, sender, recipient, purpose, prompt, response=None):
         """Record a prompt (and later its response) for the inspector's MESSAGES tab.

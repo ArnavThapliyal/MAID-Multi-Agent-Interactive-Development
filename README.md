@@ -141,7 +141,7 @@ Headless Claude Code needs the same kind of allow rule. Add this to `~/.claude/s
 }
 ```
 
-The repo's `.claude/settings.json` carries the same rule, but Claude Code only applies project settings once you have trusted the folder in an interactive session. The orchestrator does not depend on either: it passes `--allowedTools` for both MCP tools on every `claude` call it makes.
+That rule is only needed for your own headless `claude` sessions. The orchestrator does not depend on it: it passes `--allowedTools` for both MCP tools on every `claude` call it makes.
 
 **6. Test both directions**
 

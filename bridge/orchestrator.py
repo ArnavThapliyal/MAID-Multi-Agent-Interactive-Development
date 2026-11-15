@@ -218,6 +218,7 @@ def agent0_chat(messages, purpose, tools=None, tool_choice=None):
             {"role": "user", "content": "Steering from the user, to apply from now on:\n- " + "\n- ".join(steering)}
         ]
     control.set_agent("agent0", "thinking", purpose, model=get_model("local"))
+    control.chunk("agent0", "info", "\n── agent 0 · %s ──\n" % purpose)
     shown = next(m["content"] for m in reversed(messages) if m["role"] == "user" and not m["content"].startswith("Steering from"))
     if steering:
         shown += "\n\n[steering] " + " | ".join(steering)
@@ -306,11 +307,17 @@ def build_repo_map(repo):
     return "\n".join(shown)
 
 
-def snapshot(repo):
+def snapshot(repo, also=()):
     """Map every dirty path (modified, staged, deleted or untracked) to its content hash.
 
     A path that is clean relative to HEAD does not appear. Comparing two snapshots
     therefore shows exactly which paths changed in between.
+
+    Args:
+        also: extra paths to hash whatever git says about them. Pass the earlier
+            snapshot here when taking the "after" one: a file that a worker merely
+            made git-ignored (by editing .gitignore) drops out of git's untracked
+            list, and without this it would look like it had been deleted.
 
     Side effects: runs `git diff` and `git ls-files` (read-only).
     @rollback: none.
@@ -318,7 +325,7 @@ def snapshot(repo):
     changed = git(repo, "diff", "--name-only", "-z", "HEAD").stdout.split("\0")
     untracked = git(repo, "ls-files", "-o", "--exclude-standard", "-z").stdout.split("\0")
     result = {}
-    for path in changed + untracked:
+    for path in changed + untracked + list(also):
         # Bytecode caches are a by-product of running Python, not a worker edit
         if not path or "__pycache__/" in path or path.endswith(".pyc"):
             continue
@@ -705,6 +712,7 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
         prompt=prompt,
     )
     control.set_agent(agent, "coding" if allow_edits else "reviewing", purpose, model=get_model(agent) or "default")
+    control.chunk(agent, "info", "\n── %s · %s ──\n" % (agent, purpose))
     message_id = control.add_message("agent0", agent, purpose, prompt)
     started = time.monotonic()
     # The worker (and the MCP server it starts) logs under the same correlation ID
@@ -815,12 +823,17 @@ def run_cli(agent, prompt, repo, allow_edits, purpose):
 def route_unit(plan, unit, repo_map, feedback):
     """Phase 3a: have Agent 0 pick a worker for one unit by calling ask_agy or ask_claude.
 
-    Returns: (agent, instructions, reason). Falls back to the spec's suggested agent
+    If the user pinned an agent on the unit (unit["pinned_agent"]), Agent 0 is offered
+    only that agent's tool, so it still writes the instructions but cannot reroute.
+
+    Returns: (agent, instructions, reason). Falls back to the pinned or suggested agent
         and the unit description if Agent 0 returns no usable tool call.
 
     Side effects: one Agent 0 call with tool_choice="required".
     @rollback: none needed; no worker has run yet.
     """
+    pinned = unit.get("pinned_agent") if unit.get("pinned_agent") in AGENTS else ""
+    tools = [tool for tool in WORKER_TOOLS if not pinned or tool["function"]["name"] == "ask_" + pinned]
     request = (
         "Dispatch this atomic unit by calling exactly one tool: ask_agy or ask_claude. "
         "%s Write `prompt` as complete, self-contained instructions for implementing "
@@ -836,7 +849,7 @@ def route_unit(plan, unit, repo_map, feedback):
         reply = agent0_chat(
             [{"role": "system", "content": AGENT0_SYSTEM}, {"role": "user", "content": request}],
             "route %s" % unit["id"],
-            tools=WORKER_TOOLS,
+            tools=tools,
             tool_choice="required",
         )
         call = (reply.get("tool_calls") or [])[0]["function"]
@@ -848,7 +861,7 @@ def route_unit(plan, unit, repo_map, feedback):
         source = "agent0_tool_call"
     except (IndexError, KeyError, TypeError, ValueError) as error:
         log_event(logger, "route_fallback", "no usable tool call; using the spec's suggestion", level=30, error=repr(error))
-        choice = (unit["suggested_agent"], unit["description"], unit["routing_reason"] or "spec suggestion")
+        choice = (pinned or unit["suggested_agent"], unit["description"], unit["routing_reason"] or "spec suggestion")
         source = "spec_fallback"
     log_event(
         logger,
@@ -859,7 +872,11 @@ def route_unit(plan, unit, repo_map, feedback):
         reason=choice[2],
         source=source,
         suggested_agent=unit["suggested_agent"],
+        pinned_agent=pinned,
     )
+    if pinned and choice[0] != pinned:
+        # Invariant: a pinned agent is never overridden
+        choice = (pinned, choice[1], "pinned by the user")
     return choice
 
 
@@ -1158,7 +1175,8 @@ def verify_unit(repo, unit, state, worker_agent, args):
     @rollback: none needed; this function changes nothing itself.
     """
     file = unit["file"]
-    touched = touched_paths(state["before"], snapshot(repo))
+    # Invariant: paths are compared by content, so a file that only became git-ignored is untouched
+    touched = touched_paths(state["before"], snapshot(repo, also=state["before"]))
     after_text = read_text(repo / file)
     checks = []
     control.update_unit(unit["id"], column="review", status="verifying")
@@ -1249,7 +1267,7 @@ def execute_unit(plan, unit, repo, repo_map, spec_path, args, route=None):
             passed, checks, touched = verify_unit(repo, unit, state, agent, args)
         except (RunHalted, KeyboardInterrupt):
             # Invariant: a halted run leaves no half-finished unit behind
-            rollback_unit(repo, unit, state, touched_paths(state["before"], snapshot(repo)))
+            rollback_unit(repo, unit, state, touched_paths(state["before"], snapshot(repo, also=state["before"])))
             control.update_unit(unit["id"], column="backlog", status="halted and rolled back")
             raise
         if passed:
@@ -1661,6 +1679,15 @@ def main(argv=None):
             # The spec now exists, so workers see it in the repo map too
             repo_map = build_repo_map(repo)
             for unit in plan["units"]:
+                # Edits made on the unit's card (description, pinned agent, skip) apply up to this point
+                edits = control.take_unit_edits(unit["id"])
+                if edits.get("skip"):
+                    log_event(logger, "unit_skipped", "%s skipped by the user" % unit["id"], level=30, unit=unit["id"])
+                    results.append({"unit": unit, "status": "skipped", "agent": "", "attempts": 0, "checks": [], "rollback": ""})
+                    continue
+                if edits:
+                    unit.update(edits)
+                    log_event(logger, "unit_edited", "%s edited by the user" % unit["id"], unit=unit["id"], edits=edits)
                 results.append(execute_unit(plan, unit, repo, repo_map, spec_path, args))
                 # Invariant: later units may depend on earlier ones, so stop at the first failure
                 if results[-1]["status"] != "passed":
@@ -1682,11 +1709,12 @@ def main(argv=None):
         for key in ("agent0", "agy", "claude"):
             control.set_agent(key, "idle")
 
-    failed = [result for result in results if result["status"] != "passed"]
+    failed = [result for result in results if result["status"] == "failed"]
     log_event(
         logger,
         "run_end",
-        "run %s finished: %d passed, %d failed" % (get_correlation_id(), len(results) - len(failed), len(failed)),
+        "run %s finished: %d passed, %d failed"
+        % (get_correlation_id(), sum(1 for result in results if result["status"] == "passed"), len(failed)),
         level=40 if failed else 20,
         spec_path=str(spec_path),
         git_head_before=base_commit,
