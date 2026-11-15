@@ -1,0 +1,233 @@
+{
+  "headline": {
+    "local_tok_s": 10.57,
+    "local_ttft_s": 1.41,
+    "clarify_latency_s": 29.7,
+    "plan_latency_s": 55.7,
+    "plan_valid_first_try": true,
+    "route_latency_s": 34.75,
+    "route_valid_pct": 100,
+    "agy_latency_s": 11.99,
+    "claude_latency_s": 5.31,
+    "claude_cost_per_call_usd": 0.1305,
+    "e2e_wall_s": 319.3,
+    "e2e_units_passed": 2,
+    "e2e_attempts": 3,
+    "e2e_cost_usd": 0.4529,
+    "dashboard_overhead_pct": -1.0,
+    "lmstudio_cpu_peak_pct": 103,
+    "lmstudio_rss_peak_mb": 10714,
+    "available_mem_min_mb": 5543,
+    "maid_cpu_avg_pct": 0.5
+  },
+  "results": {
+    "b1": {
+      "prompts": [
+        {
+          "id": "short",
+          "runs": [
+            {
+              "tok_s": 11.4,
+              "ttft_s": 1.272,
+              "duration_s": 7.939,
+              "prompt_tokens": 56,
+              "completion_tokens": 76
+            },
+            {
+              "tok_s": 11.49,
+              "ttft_s": 1.004,
+              "duration_s": 7.097,
+              "prompt_tokens": 56,
+              "completion_tokens": 70
+            },
+            {
+              "tok_s": 11.3,
+              "ttft_s": 1.055,
+              "duration_s": 8.05,
+              "prompt_tokens": 56,
+              "completion_tokens": 79
+            }
+          ],
+          "tok_s": 11.4,
+          "ttft_s": 1.05,
+          "completion_tokens": 76
+        },
+        {
+          "id": "code",
+          "runs": [
+            {
+              "tok_s": 11.02,
+              "ttft_s": 1.428,
+              "duration_s": 22.483,
+              "prompt_tokens": 77,
+              "completion_tokens": 232
+            },
+            {
+              "tok_s": 10.52,
+              "ttft_s": 1.349,
+              "duration_s": 26.632,
+              "prompt_tokens": 77,
+              "completion_tokens": 266
+            },
+            {
+              "tok_s": 10.46,
+              "ttft_s": 1.473,
+              "duration_s": 41.347,
+              "prompt_tokens": 77,
+              "completion_tokens": 417
+            }
+          ],
+          "tok_s": 10.52,
+          "ttft_s": 1.43,
+          "completion_tokens": 266
+        },
+        {
+          "id": "long",
+          "runs": [
+            {
+              "tok_s": 10.57,
+              "ttft_s": 1.407,
+              "duration_s": 85.403,
+              "prompt_tokens": 70,
+              "completion_tokens": 888
+            },
+            {
+              "tok_s": 10.3,
+              "ttft_s": 1.65,
+              "duration_s": 119.846,
+              "prompt_tokens": 70,
+              "completion_tokens": 1218
+            },
+            {
+              "tok_s": 10.34,
+              "ttft_s": 1.816,
+              "duration_s": 116.939,
+              "prompt_tokens": 70,
+              "completion_tokens": 1190
+            }
+          ],
+          "tok_s": 10.34,
+          "ttft_s": 1.65,
+          "completion_tokens": 1190
+        }
+      ],
+      "repeats": 3
+    },
+    "b2": {
+      "clarify_latency_s": 29.7,
+      "questions": 0,
+      "plan_latency_s": 55.7,
+      "plan_attempts": 1,
+      "plan_valid_first_try": true,
+      "units": 2
+    },
+    "b3": {
+      "units": [
+        {
+          "id": "U1",
+          "agent": "agy",
+          "latency_s": 46.2,
+          "valid": true
+        },
+        {
+          "id": "U2",
+          "agent": "agy",
+          "latency_s": 23.3,
+          "valid": true
+        }
+      ]
+    },
+    "b4": {
+      "agy": [
+        {
+          "latency_s": 11.838,
+          "ok": true,
+          "cost_usd": null
+        },
+        {
+          "latency_s": 12.15,
+          "ok": true,
+          "cost_usd": null
+        }
+      ],
+      "claude": [
+        {
+          "latency_s": 5.761,
+          "ok": true,
+          "cost_usd": 0.1573
+        },
+        {
+          "latency_s": 4.858,
+          "ok": true,
+          "cost_usd": 0.1038
+        }
+      ]
+    },
+    "b5": {
+      "task": "Create the file doc/NOTES.md containing a five-line plain-language explanation of what retry with exponential backoff is. Then add the line doc/NOTES.md to .gitignore so the notes are not tracked. These are two separate units: one for doc/NOTES.md and one for .gitignore.",
+      "exit_code": 0,
+      "run_status": "done",
+      "wall_s": 319.3,
+      "units_total": 2,
+      "units_passed": 2,
+      "attempts": 3,
+      "units": [
+        {
+          "id": "U1",
+          "file": "doc/NOTES.md",
+          "agent": "agy",
+          "status": "passed",
+          "attempt": 1
+        },
+        {
+          "id": "U2",
+          "file": ".gitignore",
+          "agent": "agy",
+          "status": "passed",
+          "attempt": 2
+        }
+      ],
+      "phases": {
+        "plan": {
+          "seconds": 57.5,
+          "calls": 1
+        },
+        "route": {
+          "seconds": 99.6,
+          "calls": 3
+        },
+        "execute": {
+          "seconds": 126.9,
+          "calls": 3
+        },
+        "review": {
+          "seconds": 34.9,
+          "calls": 3
+        }
+      },
+      "cost_usd": 0.4529,
+      "by_agent_s": {
+        "local": 157.1,
+        "agy": 126.9,
+        "claude": 34.9
+      }
+    },
+    "b6": {
+      "bare": [
+        10.01,
+        9.21,
+        8.81
+      ],
+      "attached": [
+        9.8,
+        9.3,
+        9.18
+      ],
+      "bare_tok_s": 9.21,
+      "attached_tok_s": 9.3,
+      "overhead_pct": -1.0,
+      "attached_client": "headless browser showing the live stream"
+    }
+  },
+  "quick": false
+}

@@ -1,0 +1,21 @@
+{
+  "date": "2026-11-15T18:55+05:30",
+  "machine": "Mac16,8",
+  "chip": "Apple M4 Pro",
+  "cores": "14 (10 performance + 4 efficiency)",
+  "memory_gb": 48,
+  "os": "Darwin 27.2.1",
+  "python": "3.11.15",
+  "local_model": "qwen/qwen3.8-27b",
+  "quantization": "6bit",
+  "context_length": 132000,
+  "model_size_gb": 22.81,
+  "reasoning_effort": "low",
+  "max_tokens": 8000,
+  "agy_model": "gemini-3.8-flash-medium",
+  "claude_model": "default",
+  "agy_version": "1.5.9",
+  "claude_version": "2.1.311 (Claude Code)",
+  "maid_commit": "9d77357",
+  "label": "m4pro-48gb"
+}
