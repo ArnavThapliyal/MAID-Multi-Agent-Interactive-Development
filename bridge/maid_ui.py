@@ -1268,7 +1268,7 @@ function renderStrip(){
   if (!metrics) return;
   const {t, last, spent} = metricFacts();
   const parts = [["tok/s", t.local.tok_s.toFixed(1)], ["first token", t.local.last_ttft_s==null ? "n/a" : t.local.last_ttft_s.toFixed(1)+"s"],
-    ["LM Studio CPU", Math.round(last.groups.lmstudio.cpu)+"%"], ["free mem", last.memory.free_mb==null ? "n/a" : gb(last.memory.free_mb)],
+    ["LM Studio CPU", Math.round(last.groups.lmstudio.cpu)+"%"], ["available mem", last.memory.available_mb==null ? "n/a" : gb(last.memory.available_mb)],
     ["time: local", Math.round(spent("local"))+"s"], ["agy", Math.round(spent("agy"))+"s"], ["claude", Math.round(spent("claude"))+"s"], ["Claude cost", "$"+t.claude.cost_usd.toFixed(2)]];
   if (!changed("strip", parts)) return;
   $("strip").replaceChildren(...parts.map(([label,value]) => h("span",{}, label+" ", h("b",{},value))));
@@ -1281,7 +1281,7 @@ function paintMetrics(){
       kpi(t.local.tok_s.toFixed(1), "tokens / second (last call)"), kpi(t.local.last_ttft_s==null?"n/a":t.local.last_ttft_s.toFixed(2)+"s", "time to first token"),
       kpi(String(t.local.prompt_tokens+t.local.completion_tokens), "local tokens this session"), kpi("$"+t.claude.cost_usd.toFixed(2), "Claude cost this session"),
       kpi(t.agy.calls_today+"/"+(t.agy.quota_est||"?"), "agy calls today"), kpi(Math.round(last.groups.lmstudio.cpu)+"%", "LM Studio CPU"),
-      kpi(gb(last.groups.lmstudio.rss_mb), "LM Studio resident memory"), kpi(last.memory.free_mb==null?"n/a":gb(last.memory.free_mb), "free memory"),
+      kpi(gb(last.groups.lmstudio.rss_mb), "LM Studio resident memory"), kpi(last.memory.available_mb==null?"n/a":gb(last.memory.available_mb), "available memory (free + inactive)"),
       kpi(last.memory.wired_mb==null?"n/a":gb(last.memory.wired_mb), "wired memory"), kpi(String(last.load1), "load average (1 min)")),
     h("div",{class:"sect"},"Tokens / second per local call ("+local.length+")"), spark(local.map(c=>c.tok_s||0)),
     h("div",{class:"sect"},"LM Studio CPU %, last "+metrics.samples.length+" samples (2 s apart)"), spark(metrics.samples.map(s=>s.groups.lmstudio.cpu)),

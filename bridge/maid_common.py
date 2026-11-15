@@ -840,7 +840,10 @@ def parse_ps(text):
 
 
 def parse_vm_stat(text):
-    """Turn macOS `vm_stat` output into megabytes: free, active, wired, compressed.
+    """Turn macOS `vm_stat` output into megabytes: free, inactive, active, wired, compressed.
+
+    Also returns "available_mb" (free + inactive). macOS keeps very little memory
+    strictly free, so that sum is the figure that says how much room is left.
 
     Returns: {} if the output is not vm_stat's (for example on Linux).
 
@@ -852,6 +855,7 @@ def parse_vm_stat(text):
     scale = int(page.group(1)) / (1024.0 * 1024.0)
     wanted = {
         "free_mb": "Pages free",
+        "inactive_mb": "Pages inactive",
         "active_mb": "Pages active",
         "wired_mb": "Pages wired down",
         "compressed_mb": "Pages occupied by compressor",
@@ -861,6 +865,8 @@ def parse_vm_stat(text):
         match = re.search(r"%s:\s+(\d+)" % re.escape(label), text)
         if match:
             memory[key] = round(int(match.group(1)) * scale)
+    if "free_mb" in memory:
+        memory["available_mb"] = memory["free_mb"] + memory.get("inactive_mb", 0)
     return memory
 
 

@@ -256,6 +256,7 @@ class ResourceSamplerTest(unittest.TestCase):
     VM_STAT = (
         "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
         "Pages free:                               64000.\n"
+        "Pages inactive:                          192000.\n"
         "Pages active:                            640000.\n"
         "Pages wired down:                        128000.\n"
         "Pages occupied by compressor:             32000.\n"
@@ -271,7 +272,7 @@ class ResourceSamplerTest(unittest.TestCase):
     def test_parse_vm_stat(self):
         self.assertEqual(
             maid_common.parse_vm_stat(self.VM_STAT),
-            {"free_mb": 1000, "active_mb": 10000, "wired_mb": 2000, "compressed_mb": 500},
+            {"free_mb": 1000, "inactive_mb": 3000, "active_mb": 10000, "wired_mb": 2000, "compressed_mb": 500, "available_mb": 4000},
         )
         self.assertEqual(maid_common.parse_vm_stat("MemTotal: 1 kB"), {})
 
