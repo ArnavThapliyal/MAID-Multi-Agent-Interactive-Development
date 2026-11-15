@@ -132,7 +132,7 @@ Every script logs to `log/maid_execution.jsonl` and `log/maid_human.log` through
 | `orchestrator.py` | The four phases, worker CLI calls, checkpoint/verify/rollback, `--self-test`. |
 | `maid_runtime.py` | `RunControl` (live state, pause/halt/steer, question and permission prompts) and `SandboxGate`. |
 | `maid_common.py` | Config, model discovery and runtime switching, the streaming LM Studio client, telemetry and the status line. |
-| `maid_ui.py` | The dashboard: `http.server`, REST endpoints, Server-Sent Events. |
+| `maid_ui.py` | The dashboard: `http.server`, REST endpoints, Server-Sent Events, card actions, metrics. |
 | `lmstudio_mcp.py` | MCP stdio server for agy and Claude Code. |
 
 ### Run control
@@ -176,6 +176,24 @@ The orchestrator never talks to the user directly. It goes through one `RunContr
 ```
 
 The lock itself is the worker CLIs' own behaviour: they run with the repository as working directory and, headless, refuse paths outside it. The gate is the only way a directory gets added. The MCP server is a grandchild of the orchestrator, so the two exchange requests and answers as files under `log/sandbox/<correlation-id>/`; a request nobody answers is denied.
+
+### Scope check
+
+Before a worker runs, `snapshot()` records the content hash of every dirty path; afterwards the same paths are hashed again, plus whatever is newly dirty. A path counts as touched only if its content changed. Hashing the earlier paths directly, rather than asking git again, matters when a worker edits `.gitignore`: a file that merely became ignored disappears from git's untracked list but is not a change.
+
+### Unit edits
+
+Until a unit starts, its card can be edited from the dashboard. `RunControl.edit_unit()` stores a new description, a pinned worker or a skip flag; the run loop takes those edits immediately before dispatching the unit. A pinned unit still goes through Agent 0, which writes the worker's instructions, but Agent 0 is offered only the pinned agent's tool.
+
+### Monitoring
+
+`lmstudio_chat()` records time to first token and generation speed for every call, and `Telemetry` keeps a bounded per-call history for all three agents. `ResourceSampler` runs one `ps` and one `vm_stat` every two seconds and groups CPU and memory by LM Studio, MAID and the headless worker calls. The dashboard reads both through `/api/metrics`; the benchmark suite uses the same classes.
+
+The dashboard's own cost is kept low on purpose: `UIControl` coalesces stream chunks into one event per 100 ms, the page redraws a zone only when its data signature changes and appends to the stream pane instead of repainting it, and git and spec lookups are cached for three seconds.
+
+### Benchmarks
+
+`benchmarks/bench.py` measures six things: local speed, planning, routing, worker round trips, a fixed end-to-end task, and dashboard overhead (the same prompt with and without the dashboard attached, interleaved). It writes `system.json`, `metrics.json`, `samples.csv`, `summary.md` and screenshots to one folder per run; `benchmarks/compare.py` lines result folders up against a baseline.
 
 ### Review fallback
 

@@ -52,6 +52,7 @@ A review that produces no verdict never passes silently. The reviewer is asked o
 | `bridge/maid_common.py` | Config, model discovery and switching, the streaming LM Studio client, telemetry and the status line, git helpers. |
 | `bridge/lmstudio_mcp.py` | MCP server exposing `ask_local_model` and `request_outside_access` to agy and Claude Code. |
 | `tests/` | Unit tests (standard-library `unittest`). |
+| `benchmarks/` | Benchmark suite, comparison tool and result folders. See [benchmarks/README.md](benchmarks/README.md). |
 | `logg-template/LoggingTemplate.py` | Structured logging used by every script. |
 | `doc/ARCHITECTURE.md` | Research findings and the planned architecture. |
 | `doc/tasks/` | Task specs written by the orchestrator. |
@@ -186,19 +187,48 @@ A single-page dashboard served by Python's `http.server`, with live updates over
 | Zone | What it shows |
 |---|---|
 | **Top bar** | Project selector, git branch with `+added -deleted`, a model dropdown per agent, the new-task input, and Agent 0's clarifying questions as answer cards. |
-| **Kanban board** | Backlog → In Progress → Review → Done. One card per atomic unit with its ID, target file, assigned worker, verification checks, rollback command and a **Rollback Unit** button. Units from earlier specs in `doc/tasks/` appear as dimmed cards. |
+| **Kanban board** | Backlog → In Progress → Review → Done. One card per atomic unit with its ID, target file, assigned worker, verification checks and rollback command. Each card has a `⋯` menu (see below). Units from earlier specs in `doc/tasks/` are grouped under "Earlier runs" with their spec title and date; clicking one opens its spec. |
 | **Agent blocks** | Agent 0, agy and claude: live state (`idle`, `thinking`, `coding`, `reviewing`, `awaiting_permission`), active model, current target, elapsed time. |
-| **Inspector** | Opens when you click an agent or a card. Tabs: **TERMINAL / STREAM** (Agent 0's tokens as they are generated, worker stdout/stderr), **GIT DIFF** (colourised diff of the unit's file and its rollback command), **MESSAGES** (exact prompts and raw responses), **TRACES** (records from `log/maid_execution.jsonl` for the run's correlation ID). Below the tabs: **Pause**, **Halt** and a **steer** box. |
-| **Footer** | The status line. |
+| **Inspector** | Opens when you click an agent or a card. Tabs: **STREAM** (Agent 0's tokens as they are generated, worker stdout/stderr, one header per call), **DIFF** (each verification check with its full detail, the colourised diff of the unit's file and its rollback command), **MESSAGES** (exact prompts and raw responses), **TRACES** (records from `log/maid_execution.jsonl` for the run's correlation ID), **METRICS** (live speed and resource figures), **SPEC** (the run's task spec). Below the tabs: **Pause**, **Halt** and a **steer** box. |
+| **Footer** | A metrics strip (tokens/second, time to first token, LM Studio CPU, available memory, time per agent, Claude cost) above the status line. Click the strip to open METRICS. |
 
 Controls:
 
 - **Pause** takes effect between agent calls; a worker that is already running finishes first.
 - **Halt** stops the worker in progress and rolls back the unit it was on.
 - **Steer** queues text for the selected agent; it is injected into that agent's next prompt (next turn or retry).
-- **Rollback Unit** works for units that passed in the current dashboard session and only while no run is active. For older units, run the command shown on the card.
+- **Rollback unit** (in the card menu) works for units that passed in the current dashboard session and only while no run is active. For older units, copy the command shown on the card.
+
+Card menu (`⋯`):
+
+| Card | Actions |
+|---|---|
+| Unit that has not started | **Edit description**, **Assign to agy / claude** (or let Agent 0 choose again), **Skip** (drops it from this run) or restore it |
+| Unit that passed in this session | **Rollback unit**, open diff and checks, copy rollback command |
+| Unit that failed | **Retry as new task** (puts its description in the task box), open diff and checks |
+| Card from an earlier run | Open spec, copy rollback command, **Hide card** |
+
+Editing, assigning and skipping only work until the unit starts. Hiding a card never deletes its spec file; tick "show hidden cards" under the board to bring hidden cards back.
+
+Shortcuts: `/` focuses the task box, `Esc` closes a menu, dialog or the inspector, and `⌘`/`Ctrl` + `Enter` sends your answers to Agent 0's questions. The page remembers your tab, the "skip questions" box and whether the inspector was open. Links such as `http://127.0.0.1:8765/?inspect=agy&tab=stream` open a specific view.
+
+### Monitoring a run
+
+The METRICS tab and the strip above the footer show, while a run is going: tokens/second and time to first token of the last local call, tokens/second per call as a small chart, LM Studio CPU and memory, available and wired memory, load average, time spent per agent, and every call of the run with its duration and cost. Samples are also written to `log/metrics.jsonl`.
+
+The dashboard is built to stay out of the model's way: streamed tokens are sent to the browser at most ten times a second, a part of the page is redrawn only when its data changed, git and spec lookups are cached, and the resource sampler runs one `ps` and one `vm_stat` every two seconds. The benchmark suite measures the remaining cost (B6).
 
 The dashboard can start coding agents, so it binds to `127.0.0.1` only, rejects requests with a non-localhost `Host` header, and requires a per-process token on every state-changing request. Do not put it behind a proxy that exposes it to a network.
+
+## Benchmarks
+
+```bash
+python3 benchmarks/bench.py            # full suite, about 20-25 minutes
+python3 benchmarks/bench.py --quick    # local model only, about 4 minutes
+python3 benchmarks/compare.py          # compare every result folder
+```
+
+The suite measures local tokens/second and time to first token, planning and routing latency, worker round trips, a fixed end-to-end task, and what the dashboard costs the local model. Each run writes a folder under `benchmarks/results/` with machine-readable metrics, resource samples, a summary and dashboard screenshots, so results from different machines or models can be compared side by side. Details are in [benchmarks/README.md](benchmarks/README.md).
 
 ## Model selection
 
@@ -253,7 +283,7 @@ python3 -m unittest discover -s tests                              # offline, ab
 MAID_LIVE_TESTS=1 python3 -m unittest tests.test_three_way_mesh -v # adds the live mesh legs
 ```
 
-The offline suite covers model discovery, the streaming parser, sandbox path validation and the permission payload, the status line, the review fallback, the dashboard's HTTP layer, and a real retry-after-rollback run against a stub worker.
+The offline suite covers model discovery, the streaming parser, sandbox path validation and the permission payload, the status line, the resource sampler, the scope check, unit edits and pinned agents, the review fallback, the dashboard's HTTP layer, the benchmark arithmetic, and a real retry-after-rollback run against a stub worker.
 
 ### Configuration
 
@@ -287,6 +317,7 @@ Every script in `bridge/` writes each record twice:
 | `log/maid_execution.jsonl` | One JSON object per line. |
 | `log/maid_human.log` | The same record as indented text. |
 | `log/lmstudio_stream.log` | Agent 0's raw token stream, reasoning and answer, as it was generated. |
+| `log/metrics.jsonl` | Resource samples taken every two seconds while the dashboard is running. |
 
 Each run has a correlation ID, which workers and the MCP server inherit, so one `grep` follows a task across all three agents. Records include the exact prompts sent, the agent selected and why, CLI flags, execution time, stdout and stderr, the verification checks, the diff, and the git commit before and after each worker call.
 
